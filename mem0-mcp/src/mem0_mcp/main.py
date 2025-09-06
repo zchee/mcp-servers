@@ -1,31 +1,35 @@
 # SPDX-FileCopyrightText: 2025 mcp-servers Authors
 # SPDX-License-Identifier: Apache-2.0
 
-import os
-import contextlib
-import orjson
-from collections.abc import AsyncIterator
+from __future__ import annotations
 
+import asyncio
+import logging
+import os
+
+import orjson
 import uvicorn
 from dotenv import load_dotenv
-from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mem0 import MemoryClient
-from starlette.applications import Starlette
-from starlette.routing import Mount
-from starlette.types import Receive, Scope, Send
+from mem0 import AsyncMemoryClient
 
-load_dotenv()
+# Load environment variables
+# If MEM0_DOTENV_PATH is provided, use it; otherwise, auto-discover .env
+_dotenv_path = os.getenv("MEM0_DOTENV_PATH")
+if _dotenv_path:
+    load_dotenv(dotenv_path=_dotenv_path)
+else:
+    load_dotenv()
 
 # Initialize FastMCP server for mem0 tools
 mcp = FastMCP("mem0")
 
-# Initialize mem0 client and set default user
-mem0_client = MemoryClient(
-    org_id=os.getenv("MEM0_ORG_ID", None),
-    project_id=os.getenv("MEM0_PROJECT_ID", None),
-)
+# Lazy Mem0 client initialization (avoid import-time failures)
+_mem0_client: AsyncMemoryClient | None = None
+_mem0_client_lock = asyncio.Lock()
+_project_configured = False
+_project_config_lock = asyncio.Lock()
+
 DEFAULT_AGENT_ID = "mem0-mcp"
 CUSTOM_INSTRUCTIONS = """
 Extract the Following Information:
@@ -35,7 +39,42 @@ Extract the Following Information:
 - Related Technical Details: Include information about the programming language, dependencies, and system specifications.
 - Key Features: Highlight the main functionalities and important aspects of the snippet.
 """
-mem0_client.project.update(custom_instructions=CUSTOM_INSTRUCTIONS, enable_graph=True)
+
+
+async def _get_mem0_client() -> AsyncMemoryClient:
+    """Return a lazily-initialized Mem0 async client.
+
+    Avoids creating the client at import-time which requires MEM0_API_KEY.
+    Raises a clear error if the environment isn't configured when used.
+    """
+    global _mem0_client
+    if _mem0_client is not None:
+        return _mem0_client
+    async with _mem0_client_lock:
+        if _mem0_client is None:
+            try:
+                _mem0_client = AsyncMemoryClient(
+                    org_id=os.getenv("MEM0_ORG_ID", None),
+                    project_id=os.getenv("MEM0_PROJECT_ID", None),
+                )
+            except Exception as e:  # surface a helpful message
+                raise RuntimeError(
+                    "Mem0 client not configured. Ensure MEM0_API_KEY (and optional MEM0_ORG_ID/MEM0_PROJECT_ID) are set."
+                ) from e
+        return _mem0_client
+
+
+async def _ensure_project_config() -> None:
+    """Apply one-time project configuration for Mem0 (idempotent)."""
+    global _project_configured
+    if _project_configured:
+        return
+    async with _project_config_lock:
+        if _project_configured:
+            return
+        client = await _get_mem0_client()
+        await client.project.update(custom_instructions=CUSTOM_INSTRUCTIONS, enable_graph=True)
+        _project_configured = True
 
 
 @mcp.tool(
@@ -53,7 +92,7 @@ mem0_client.project.update(custom_instructions=CUSTOM_INSTRUCTIONS, enable_graph
     - Error handling and debugging tips
     The preference will be indexed for semantic search and can be retrieved later using natural language queries."""
 )
-async def add_coding_preference(text: str) -> str:
+async def add_coding_preference(text: str) -> dict[str, str]:
     """Add a new coding preference to mem0.
 
     This tool is designed to store code snippets, implementation patterns, and programming knowledge.
@@ -68,11 +107,18 @@ async def add_coding_preference(text: str) -> str:
         text: The content to store in memory, including code, documentation, and context
     """
     try:
+        await _ensure_project_config()
+        client = await _get_mem0_client()
         messages = [{"role": "user", "content": text}]
-        mem0_client.add(messages, version="v2", agent_id=DEFAULT_AGENT_ID, output_format="v1.1")
-        return f"Successfully added preference: {text}"
+        await client.add(
+            messages,
+            version="v2",
+            agent_id=DEFAULT_AGENT_ID,
+            output_format="v1.1",
+        )
+        return {"status": "ok", "message": "Preference added"}
     except Exception as e:
-        return f"Error adding preference: {str(e)}"
+        return {"status": "error", "error": str(e)}
 
 
 @mcp.tool(
@@ -99,10 +145,15 @@ async def get_all_coding_preferences() -> str:
     - Setup guides and examples
     Each preference includes metadata about when it was created and its content type.
     """
+    await _ensure_project_config()
     try:
-        memories = mem0_client.get_all(version="v2", agent_id=DEFAULT_AGENT_ID, page=1, page_size=50)
-        flattened_memories = [memory["memory"] for memory in memories]
-        return orjson.dumps(flattened_memories).decode("utf-8")
+        client = await _get_mem0_client()
+        memories = await client.get_all(
+            version="v2",
+            page=1,
+            filters={"AND": [{"agent_id": DEFAULT_AGENT_ID}]},
+        )
+        return orjson.dumps(list(memories)).decode("utf-8")
     except Exception as e:
         return f"Error getting preferences: {str(e)}"
 
@@ -133,49 +184,31 @@ async def search_coding_preferences(query: str) -> str:
         query: Search query string describing what you're looking for. Can be natural language
               or specific technical terms.
     """
+    await _ensure_project_config()
     try:
-        memories = mem0_client.search(query, agent_id=DEFAULT_AGENT_ID, output_format="v1.1")
-        flattened_memories = [memory["memory"] for memory in memories]
-        return orjson.dumps(flattened_memories).decode("utf-8")
+        client = await _get_mem0_client()
+        memories = await client.search(
+            query,
+            agent_id=DEFAULT_AGENT_ID,
+            version="v2",
+            output_format="v1.1",
+            filters={"AND": [{"agent_id": DEFAULT_AGENT_ID}]},
+        )
+        return orjson.dumps(list(memories)).decode("utf-8")
     except Exception as e:
-        return f"Error searching preferences: {str(e)}"
+        return f"Error getting preferences: {str(e)}"
 
 
-def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
-    session_manager = StreamableHTTPSessionManager(
-        app=mcp_server,
-        event_store=None,
-        json_response=True,
-        stateless=True,
-    )
+def main() -> None:
+    """CLI entrypoint for running the Mem0 MCP server.
 
-    async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
-        await session_manager.handle_request(scope, receive, send)
-
-    @contextlib.asynccontextmanager
-    async def lifespan(_: Starlette) -> AsyncIterator[None]:
-        """Context manager for session manager."""
-        async with session_manager.run():
-            print("Application started with StreamableHTTP session manager")
-            try:
-                yield
-            finally:
-                print("Application shutting down")
-
-    return Starlette(
-        debug=debug,
-        routes=[
-            Mount("/mcp", app=handle_streamable_http),
-        ],
-        lifespan=lifespan,
-    )
-
-
-# Main entry point
-def main():
+    Provides two transports:
+    - stdio (default): for MCP clients
+    - HTTP/SSE (--http): for web/HTTP clients
+    """
     import argparse
 
-    mcp_server = mcp._mcp_server
+    logging.basicConfig(level=logging.DEBUG)
 
     parser = argparse.ArgumentParser(description="Run a Mem0 MCP server")
 
@@ -195,7 +228,8 @@ def main():
 
     match use_http:
         case True:
-            starlette_app = create_starlette_app(mcp_server, debug=True)
+            # Use FastMCP's built-in Streamable HTTP app
+            starlette_app = mcp.streamable_http_app()
             uvicorn.run(
                 starlette_app,
                 host=args.host if args.host else "127.0.0.1",
