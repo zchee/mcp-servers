@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mem0-mcp"
 dynamic = ["version"]
-description = "Add your description here"
+description = "An MCP server that uses Mem0 to store and semantically search coding preferences, snippets, and docs."
 license = "Apache-2.0"
 authors = [
   { name = "Koichi Shiraishi", email = "zchee.io@gmail.com" },
@@ -114,7 +114,7 @@ typeCheckingMode = "standard"
 
 # TODO(zchee): switch to uv?
 [tool.coverage.run]
-source_pkgs = ["mem0-mcp", "tests"]
+source_pkgs = ["mem0_mcp"]
 branch = true
 parallel = true
 omit = [
@@ -122,7 +122,7 @@ omit = [
 ]
 
 [tool.coverage.paths]
-mem0-mcp = ["src/mem0_mcp", "*/mem0_mcp/src/mem0_mcp"]
+mem0_mcp = ["src/mem0_mcp", "*/mem0_mcp/src/mem0_mcp"]
 tests = ["tests", "*/mem0_mcp/tests"]
 
 [tool.coverage.report]
