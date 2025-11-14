@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import logging
-from typing import Any
+from typing import Any, Protocol, cast
 
 from mcp.server.fastmcp import FastMCP
 import vertexai
@@ -33,14 +33,24 @@ from .validators import (
 logger = logging.getLogger(__name__)
 
 
+class _ConfigProtocol(Protocol):
+    project_id: str
+    location: str
+    agent_engine_name: str | None
+    credentials_path: Any
+
+    def copy_with_agent_engine(self, agent_engine_name: str) -> Config: ...
+
+
 def register_tools(server: FastMCP) -> None:
     """Bind tool handlers to the FastMCP server instance."""
 
     async def _ensure_client(project_id: str, location: str) -> vertexai.Client:
+        current_config = cast(_ConfigProtocol, app_state.config)
         if (
             app_state.client is not None
-            and app_state.config.project_id == project_id
-            and app_state.config.location == location
+            and current_config.project_id == project_id
+            and current_config.location == location
         ):
             return app_state.client
 
@@ -52,8 +62,8 @@ def register_tools(server: FastMCP) -> None:
         app_state.config = Config(
             project_id=project_id,
             location=location,
-            agent_engine_name=app_state.config.agent_engine_name,
-            credentials_path=app_state.config.credentials_path,
+            agent_engine_name=current_config.agent_engine_name,
+            credentials_path=current_config.credentials_path,
         )
         logger.info("Vertex client refreshed for project %s", project_id)
         return client
@@ -99,7 +109,8 @@ def register_tools(server: FastMCP) -> None:
             name = extract_agent_engine_name(engine)
 
         app_state.agent_engine_name = name
-        app_state.config = app_state.config.copy_with_agent_engine(name)
+        config_state = cast(_ConfigProtocol, app_state.config)
+        app_state.config = config_state.copy_with_agent_engine(name)
         return name
 
     def _get_client() -> vertexai.Client:
@@ -246,7 +257,7 @@ def register_tools(server: FastMCP) -> None:
             logger.error("Failed to retrieve memories: %s", exc)
             return format_error_response(str(exc))
 
-        formatted = []
+        formatted: list[dict[str, Any]] = []
         for memory in list(results):
             payload = format_memory(memory)
             if search_query and hasattr(memory, "distance"):
@@ -348,3 +359,12 @@ def register_tools(server: FastMCP) -> None:
             return format_error_response(str(exc))
 
         return format_success_response({"count": len(memories), "memories": memories})
+
+    _ = (
+        initialize_memory_bank,
+        generate_memories,
+        retrieve_memories,
+        create_memory,
+        delete_memory,
+        list_memories,
+    )
