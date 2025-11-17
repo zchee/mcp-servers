@@ -6,7 +6,7 @@ from collections.abc import Iterable
 import logging
 from typing import Any, Protocol, cast
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 import vertexai
 
 from .app_state import app_state

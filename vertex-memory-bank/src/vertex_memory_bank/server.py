@@ -8,7 +8,7 @@ import logging
 import sys
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 import vertexai
 
 from .app_state import AppState, app_state
