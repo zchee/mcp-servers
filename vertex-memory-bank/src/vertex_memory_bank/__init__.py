@@ -1,6 +1,6 @@
 """Vertex Memory Bank MCP server package."""
 
-from . import formatters, validators
+from . import clients, errors, formatters, services, validators
 from .server import run
 
 
@@ -9,4 +9,12 @@ def main() -> None:
     run()
 
 
-__all__ = ["formatters", "main", "run", "validators"]
+__all__ = [
+    "clients",
+    "errors",
+    "formatters",
+    "main",
+    "run",
+    "services",
+    "validators",
+]

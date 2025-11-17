@@ -22,3 +22,5 @@ def register_prompts(server: FastMCP) -> None:
     async def memory_consolidation(existing_memories: str, new_fact: str) -> str:
         """Prompt for reconciling a new fact with existing memories."""
         return f"""Existing memories:\n{existing_memories}\n\nNew fact:\n{new_fact}\n\nDecide whether the new fact should (a) create a new memory, (b) update an existing memory, (c) replace a conflicting memory, or (d) be ignored as redundant. Explain your reasoning."""
+
+    _ = (memory_extraction, memory_search, memory_consolidation)
