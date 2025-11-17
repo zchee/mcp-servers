@@ -8,7 +8,7 @@ def test_validate_scope_accepts_string_pairs() -> None:
 
 
 def test_validate_scope_rejects_non_dict() -> None:
-    assert validators.validate_scope([]) == "Scope must be a dictionary"
+    assert validators.validate_scope([]) == "Scope must be a dictionary"  # type: ignore[arg-type]
 
 
 def test_validate_conversation_enforces_roles() -> None:

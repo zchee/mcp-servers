@@ -66,6 +66,12 @@ Add the server to Claude Desktop:
 
 Each tool validates its inputs up front and emits structured success/error responses that MCP clients can render directly.
 
+## Architecture
+
+- `VertexClientManager` owns the lifecycle of the Vertex AI client and caches the active Agent Engine resource name.
+- `MemoryBankService` implements the core workflows (initialize, generate, retrieve, mutate) with consistent validation and error handling.
+- `tools.py` simply binds MCP tool definitions to service methods, ensuring concise, testable entry points similar to the LiveKit Agents style.
+
 ## Development
 
 ```bash
