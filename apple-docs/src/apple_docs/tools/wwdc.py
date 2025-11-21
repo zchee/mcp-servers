@@ -3,8 +3,9 @@ from collections.abc import Awaitable
 import re
 from typing import Any
 
-from apple_docs.types.wwdc import CodeExample, TopicInfo, WWDCVideo
+from apple_docs.types.wwdc import CodeExample, WWDCVideo
 from apple_docs.utils.wwdc_data_source import (
+    get_topic_by_id,
     get_videos_by_topic,
     get_videos_by_year,
     load_all_videos,
@@ -13,12 +14,15 @@ from apple_docs.utils.wwdc_data_source import (
 )
 
 
-async def load_videos_data(video_files: list[str]) -> list[WWDCVideo]:
+MAX_FULL_SEARCH_CANDIDATES = 50
+
+
+async def load_videos_details(videos: list[tuple[str, str]]) -> list[WWDCVideo]:
     """
-    Load video data for a list of video files.
+    Load detailed data for a list of videos.
 
     Args:
-        video_files: List of file paths (e.g., "videos/2024-10015.json").
+        videos: List of (year, video_id) tuples.
 
     Returns:
         List of WWDCVideo objects.
@@ -30,19 +34,15 @@ async def load_videos_data(video_files: list[str]) -> list[WWDCVideo]:
             return await load_video_data(year, video_id)
 
     tasks: list[Awaitable[WWDCVideo]] = []
-    for file_path in video_files:
-        # Extract year and video ID from filename (e.g., "videos/2024-10015.json")
-        match = re.search(r"(\d{4})-(\d+)\.json$", file_path)
-        if match:
-            year, video_id = match.groups()
-            tasks.append(load_with_sem(year, video_id))
+    for year, video_id in videos:
+        tasks.append(load_with_sem(year, video_id))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    videos: list[WWDCVideo] = []
+    videos_list: list[WWDCVideo] = []
     for res in results:
         if isinstance(res, dict):
-            videos.append(res)
-    return videos
+            videos_list.append(res)
+    return videos_list
 
 
 async def list_wwdc_videos(
@@ -122,36 +122,38 @@ async def search_wwdc_content(
         else:
             all_videos = await load_all_videos()
 
-        potential_videos: list[WWDCVideo] = []  # Using WWDCVideo type as it's what load_all_videos returns
+        metadata_matches: list[WWDCVideo] = []
+        content_candidates: list[WWDCVideo] = []
 
         for v in all_videos:
             title_match = query_lower in v.get("title", "").lower()
             topic_match = any(query_lower in t.lower() for t in v.get("topics", []))
 
-            has_code = v.get("hasCode", False)
-            has_transcript = v.get("hasTranscript", False)
-
-            if (
-                title_match
-                or topic_match
-                or (search_in in ["code", "both"] and has_code)
-                or (search_in in ["transcript", "both"] and has_transcript)
+            if title_match or topic_match:
+                metadata_matches.append(v)
+            elif (
+                (search_in in ["code", "both"] and v.get("hasCode"))
+                or (search_in in ["transcript", "both"] and v.get("hasTranscript"))
             ):
-                potential_videos.append(v)
+                content_candidates.append(v)
+
+        # Prioritize metadata matches, then content candidates, up to the limit
+        potential_videos = metadata_matches + content_candidates
+        if len(potential_videos) > MAX_FULL_SEARCH_CANDIDATES:
+            potential_videos = potential_videos[:MAX_FULL_SEARCH_CANDIDATES]
 
         if not potential_videos:
             return format_search_results([], query, search_in)
 
         # Load full data for potential matches to search content
-        # Use dataFile property if available, or construct path
-        video_files: list[str] = []
+        videos_to_load: list[tuple[str, str]] = []
         for v in potential_videos:
-            if "dataFile" in v:
-                video_files.append(v["dataFile"])
-            else:
-                video_files.append(f"videos/{v['year']}-{v['id']}.json")
+            videos_to_load.append((v["year"], v["id"]))
 
-        videos = await load_videos_data(video_files)
+        videos = await load_videos_details(videos_to_load)
+
+        # Compile regex once
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
 
         for video in videos:
             matches: list[dict[str, Any]] = []
@@ -159,7 +161,7 @@ async def search_wwdc_content(
             # Search transcript
             transcript = video.get("transcript")
             if search_in in ["transcript", "both"] and transcript:
-                transcript_matches = await asyncio.to_thread(search_in_transcript, transcript["fullText"], query_lower)
+                transcript_matches = await asyncio.to_thread(search_in_transcript, transcript["fullText"], pattern)
                 for m in transcript_matches:
                     matches.append({
                         "type": "transcript",
@@ -170,7 +172,7 @@ async def search_wwdc_content(
             # Search code
             code_examples: list[CodeExample] | None = video.get("codeExamples")
             if search_in in ["code", "both"] and code_examples:
-                code_matches = await asyncio.to_thread(search_in_code, code_examples, query_lower, language)
+                code_matches = await asyncio.to_thread(search_in_code, code_examples, pattern, language)
                 for m in code_matches:
                     matches.append({"type": "code", "context": m["context"], "timestamp": m.get("timestamp")})
 
@@ -257,14 +259,11 @@ async def get_wwdc_code_examples(
             return format_code_examples([], framework, topic, language)
 
         # Load full data
-        video_files: list[str] = []
+        videos_to_load: list[tuple[str, str]] = []
         for v in potential_videos:
-            if "dataFile" in v:
-                video_files.append(v["dataFile"])
-            else:
-                video_files.append(f"videos/{v['year']}-{v['id']}.json")
+            videos_to_load.append((v["year"], v["id"]))
 
-        videos = await load_videos_data(video_files)
+        videos = await load_videos_details(videos_to_load)
 
         for video in videos:
             video_code_examples = video.get("codeExamples")
@@ -327,7 +326,7 @@ async def browse_wwdc_topics(
                 content += "\n"
             return content
 
-        topic: TopicInfo | None = next((t for t in metadata["topics"] if t["id"] == topic_id), None)
+        topic = await get_topic_by_id(topic_id)
         if not topic:
             return f'Topic "{topic_id}" not found. Available topics: {", ".join(t["id"] for t in metadata["topics"])}'
 
@@ -386,56 +385,101 @@ async def browse_wwdc_topics(
         return f"Error: Failed to browse WWDC topics: {str(e)}"
 
 
-def search_in_transcript(full_text: str, query: str) -> list[dict[str, str]]:
+def search_in_transcript(full_text: str, pattern: re.Pattern[str]) -> list[dict[str, str]]:
     """
     Search for a query in a transcript.
 
     Args:
         full_text: The full transcript text.
-        query: The search query.
+        pattern: The compiled search pattern.
 
     Returns:
         List of matches with context.
     """
     matches: list[dict[str, str]] = []
-    lines = full_text.split("\n")
 
-    for i, line in enumerate(lines):
-        if query in line.lower():
-            context_lines = [lines[i - 1] if i > 0 else "", line, lines[i + 1] if i < len(lines) - 1 else ""]
-            context = " ... ".join(ln.strip() for ln in context_lines if ln.strip())
-            matches.append({"context": context})
+    for match in pattern.finditer(full_text):
+        start = match.start()
+        # Find start of the line
+        line_start = full_text.rfind("\n", 0, start) + 1
+
+        # Find end of the line
+        line_end = full_text.find("\n", start)
+        if line_end == -1:
+            line_end = len(full_text)
+
+        # Get context lines (previous, current, next)
+        # Find previous line start
+        prev_line_start = full_text.rfind("\n", 0, line_start - 1) + 1 if line_start > 0 else 0
+
+        # Find next line end
+        next_line_end = full_text.find("\n", line_end + 1)
+        if next_line_end == -1:
+            next_line_end = len(full_text)
+
+        context_text = full_text[prev_line_start:next_line_end].strip()
+
+        # Clean up newlines for display
+        context = " ... ".join(line.strip() for line in context_text.splitlines() if line.strip())
+
+        matches.append({"context": context})
+
+        # Optimization: If we have enough matches, stop?
+        # But the current logic returns all matches in the text.
+        # Let's limit per video if needed, but search_wwdc_content limits total matches *across* videos.
+        # Actually, search_wwdc_content takes matches[:3].
+        # So we should probably limit here too?
+        # search_wwdc_content does: matches.append(... for m in transcript_matches).
+        # Then it sorts results by len(matches).
+        # So we need a count. But do we need *all* text contexts?
+        # Probably not. Let's stick to returning all for now, or limit to reasonable number (e.g. 10) to save processing.
+        if len(matches) >= 10:
+            break
 
     return matches
 
 
-def search_in_code(code_examples: list[CodeExample], query: str, language: str | None = None) -> list[dict[str, Any]]:
+def search_in_code(code_examples: list[CodeExample], pattern: re.Pattern[str], language: str | None = None) -> list[dict[str, Any]]:
     """
     Search for a query in code examples.
 
     Args:
         code_examples: List of code examples.
-        query: The search query.
+        pattern: The compiled search pattern.
         language: Optional language filter.
 
     Returns:
         List of matches with context.
     """
     matches: list[dict[str, Any]] = []
+    target_language = language.lower() if language else None
 
     for example in code_examples:
-        if language and example["language"].lower() != language.lower():
+        if target_language and example["language"].lower() != target_language:
             continue
 
-        if query in example["code"].lower():
-            lines = example["code"].split("\n")
-            matching_lines = [line for line in lines if query in line.lower()]
+        code = example["code"]
+        for match in pattern.finditer(code):
+            start = match.start()
 
-            if matching_lines:
-                matches.append({
-                    "context": f"[{example['language']}] {example.get('title', '')}: {matching_lines[0].strip()}",
-                    "timestamp": example.get("timestamp"),
-                })
+            line_start = code.rfind("\n", 0, start) + 1
+            line_end = code.find("\n", start)
+            if line_end == -1:
+                line_end = len(code)
+
+            matched_line = code[line_start:line_end].strip()
+
+            matches.append({
+                "context": f"[{example['language']}] {example.get('title', '')}: {matched_line}",
+                "timestamp": example.get("timestamp"),
+            })
+
+            # Limit matches per example?
+            if len(matches) >= 10:
+                break
+
+        if len(matches) >= 10:
+            break
 
     return matches
 

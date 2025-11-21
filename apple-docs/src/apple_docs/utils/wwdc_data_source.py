@@ -5,7 +5,7 @@ from pathlib import Path
 import aiofiles
 import orjson
 
-from apple_docs.types.wwdc import GlobalMetadata, TopicIndex, WWDCVideo, YearIndex
+from apple_docs.types.wwdc import GlobalMetadata, TopicIndex, TopicInfo, WWDCVideo, YearIndex
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +21,7 @@ VIDEO_CACHE_SIZE = 200
 # Indices
 _videos_by_year_cache: dict[str, list[WWDCVideo]] = {}
 _videos_by_topic_cache: dict[str, list[WWDCVideo]] = {}
+_topics_cache: dict[str, TopicInfo] = {}
 
 
 async def read_bundled_file(file_path: str) -> str:
@@ -62,17 +63,36 @@ async def load_global_metadata() -> GlobalMetadata:
     Raises:
         Exception: If the metadata cannot be loaded.
     """
-    global _global_metadata_cache
+    global _global_metadata_cache, _topics_cache
     if _global_metadata_cache:
         return _global_metadata_cache
 
     try:
         data = await read_bundled_file("index.json")
         _global_metadata_cache = orjson.loads(data)
+
+        # Build topics cache
+        if _global_metadata_cache:
+             _topics_cache = {t["id"]: t for t in _global_metadata_cache["topics"]}
+
         return _global_metadata_cache  # type: ignore
     except Exception as e:
         logger.error("Failed to load global metadata", exc_info=True)
         raise Exception("Failed to load WWDC metadata.") from e
+
+
+async def get_topic_by_id(topic_id: str) -> TopicInfo | None:
+    """
+    Get a topic by its ID.
+
+    Args:
+        topic_id: The ID of the topic.
+
+    Returns:
+        The topic info, or None if not found.
+    """
+    await load_global_metadata()
+    return _topics_cache.get(topic_id)
 
 
 async def load_topic_index(topic_id: str) -> TopicIndex:
@@ -165,6 +185,8 @@ async def load_all_videos() -> list[WWDCVideo]:
         # all-videos.json has structure {"videos": [...]}
         parsed = orjson.loads(data)
         videos: list[WWDCVideo] = parsed.get("videos", [])
+        # Sort videos by year descending to prioritize recent content
+        videos.sort(key=lambda x: x.get("year", ""), reverse=True)
         _all_videos_cache = videos
 
         # Build indices
