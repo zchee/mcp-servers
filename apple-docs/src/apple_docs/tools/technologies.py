@@ -155,19 +155,19 @@ def format_technologies(groups: list[TechnologyGroup]) -> str:
     if not groups:
         return "No technologies found matching your criteria."
 
-    content = "# Apple Technologies\n\n"
+    parts: list[str] = ["# Apple Technologies\n\n"]
 
     total_techs = sum(len(g.technologies) for g in groups)
-    content += f"Found {total_techs} technologies in {len(groups)} categories.\n\n"
+    parts.append(f"Found {total_techs} technologies in {len(groups)} categories.\n\n")
 
     for group in groups:
-        content += f"## {group.title}\n\n"
+        parts.append(f"## {group.title}\n\n")
         for tech in group.technologies:
-            content += f"- [{tech.title}]({tech.url})\n"
+            parts.append(f"- [{tech.title}]({tech.url})\n")
             if tech.description:
-                content += f"  {tech.description}\n"
+                parts.append(f"  {tech.description}\n")
             if tech.tags:
-                content += f"  *Tags: {', '.join(tech.tags)}*\n"
-        content += "\n"
+                parts.append(f"  *Tags: {', '.join(tech.tags)}*\n")
+        parts.append("\n")
 
-    return content
+    return "".join(parts)

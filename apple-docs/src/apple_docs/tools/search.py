@@ -53,7 +53,7 @@ async def search_apple_docs(query: str, type: str = "all") -> str:
     except Exception as e:
         return f"Error: Failed to perform search: {str(e)}"
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     results: list[SearchResult] = []
     filter_type = None if type == "all" else type
 
@@ -156,8 +156,8 @@ def format_search_results(results: list[SearchResult], query: str) -> str:
             "or browse topics with `browse_wwdc_topics`."
         )
 
-    content = f'# Search Results for "{query}"\n\n'
-    content += f"Found {len(results)} results:\n\n"
+    parts: list[str] = [f'# Search Results for "{query}"\n\n']
+    parts.append(f"Found {len(results)} results:\n\n")
 
     # Group by category
     grouped: dict[str, list[SearchResult]] = {}
@@ -168,11 +168,11 @@ def format_search_results(results: list[SearchResult], query: str) -> str:
         grouped[cat].append(result)
 
     for category in sorted(grouped.keys()):
-        content += f"## {category}\n\n"
+        parts.append(f"## {category}\n\n")
         for result in grouped[category]:
-            content += f"- [{result.title}]({result.url})\n"
+            parts.append(f"- [{result.title}]({result.url})\n")
             if result.description:
-                content += f"  {result.description}\n"
-        content += "\n"
+                parts.append(f"  {result.description}\n")
+        parts.append("\n")
 
-    return content
+    return "".join(parts)

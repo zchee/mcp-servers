@@ -92,42 +92,42 @@ def format_json_documentation(
     Returns:
         Formatted markdown string.
     """
-    content = ""
+    parts: list[str] = []
 
-    content += formatter.format_document_header(json_data)
-    content += formatter.format_document_abstract(json_data)
+    parts.append(formatter.format_document_header(json_data))
+    parts.append(formatter.format_document_abstract(json_data))
 
     if formatter.is_specific_api_document(json_data):
-        content += formatter.format_specific_api_content(json_data)
+        parts.append(formatter.format_specific_api_content(json_data))
     else:
-        content += formatter.format_api_collection_content(json_data)
+        parts.append(formatter.format_api_collection_content(json_data))
 
-    content += formatter.format_platform_availability(json_data)
-    content += formatter.format_see_also_section(json_data)
+    parts.append(formatter.format_platform_availability(json_data))
+    parts.append(formatter.format_see_also_section(json_data))
 
     if include_related_apis:
         related_apis = extract_related_apis(json_data)
         if related_apis:
-            content += formatter.format_related_apis_section(related_apis)
+            parts.append(formatter.format_related_apis_section(related_apis))
 
     if include_references:
         references = extract_references(json_data)
         if references:
-            content += formatter.format_references_section(references)
+            parts.append(formatter.format_references_section(references))
 
     if include_similar_apis:
         similar_apis = extract_similar_apis(json_data)
         if similar_apis:
-            content += formatter.format_similar_apis_section(similar_apis)
+            parts.append(formatter.format_similar_apis_section(similar_apis))
 
     if include_platform_analysis:
         analysis = analyze_platform_compatibility(json_data)
         if analysis:
-            content += formatter.format_platform_analysis_section(analysis)
+            parts.append(formatter.format_platform_analysis_section(analysis))
 
-    content += f"---\n\n[View full documentation on Apple Developer]({original_url})"
+    parts.append(f"---\n\n[View full documentation on Apple Developer]({original_url})")
 
-    return content
+    return "".join(parts)
 
 
 def extract_related_apis(json_data: dict[str, Any]) -> list[dict[str, str]]:

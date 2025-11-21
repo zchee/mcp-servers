@@ -71,28 +71,29 @@ async def search_framework_symbols(
         symbols = [s for s in all_symbols if matches_criteria(s, symbol_type, name_pattern)]
 
         # Format results
-        result = f"# {framework} Framework Symbols\n\n"
-        result += f"**Found:** {len(symbols)} symbols"
+        parts: list[str] = [f"# {framework} Framework Symbols\n\n"]
+        parts.append(f"**Found:** {len(symbols)} symbols")
         if symbol_type != "all":
-            result += f" (Type: {symbol_type})"
+            parts.append(f" (Type: {symbol_type})")
         if name_pattern:
-            result += f" (Pattern: {name_pattern})"
-        result += "\n\n"
+            parts.append(f" (Pattern: {name_pattern})")
+        parts.append("\n\n")
 
         if not symbols:
-            result += "No symbols found matching your criteria.\n"
+            parts.append("No symbols found matching your criteria.\n")
             # Suggest collections if any
             index_items = data.get("interfaceLanguages", {}).get(language, [])
             collections = find_collections(index_items)
             if collections:
-                result += "\n## Try exploring these collections:\n\n"
+                parts.append("\n## Try exploring these collections:\n\n")
                 for col in collections[: ProcessingLimits.MAX_COLLECTIONS_TO_SHOW]:
-                    result += f"- [{col.title}](https://developer.apple.com{col.path})\n"
+                    parts.append(f"- [{col.title}](https://developer.apple.com{col.path})\n")
         else:
-            result += f"**Found:** {len(symbols)} {symbol_type if symbol_type == 'all' else pluralize_type(symbol_type).lower()}"
+            type_str = symbol_type if symbol_type == "all" else pluralize_type(symbol_type).lower()
+            parts.append(f"**Found:** {len(symbols)} {type_str}")
             if len(symbols) > limit:
-                result += f" (Showing top {limit})"
-            result += "\n\n"
+                parts.append(f" (Showing top {limit})")
+            parts.append("\n\n")
 
             # Group by type
             symbols_by_type: dict[str, list[FrameworkSymbol]] = {}
@@ -103,13 +104,13 @@ async def search_framework_symbols(
 
             for type_name in sorted(symbols_by_type.keys()):
                 type_symbols = symbols_by_type[type_name]
-                result += f"## {pluralize_type(type_name)}\n"
+                parts.append(f"## {pluralize_type(type_name)}\n")
                 for s in type_symbols:
                     url = f"https://developer.apple.com{s.path}"
-                    result += f"- [{s.title}]({url})\n"
-                result += "\n"
+                    parts.append(f"- [{s.title}]({url})\n")
+                parts.append("\n")
 
-        return result
+        return "".join(parts)
 
     except Exception as e:
         return f"Error: Failed to search framework symbols: {str(e)}"
