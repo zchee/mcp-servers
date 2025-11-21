@@ -109,8 +109,11 @@ def apply_technology_filters(
     filtered_groups: list[TechnologyGroup] = []
     count = 0
 
+    target_category = category.lower() if category else None
+    target_language = language.lower() if language else None
+
     for group in groups:
-        if category and category.lower() not in group.title.lower():
+        if target_category and target_category not in group.title.lower():
             continue
 
         filtered_techs: list[Technology] = []
@@ -121,10 +124,9 @@ def apply_technology_filters(
             if not include_beta and "beta" in tech.tags:
                 continue
 
-            if (
-                language
-                and language.lower() not in [t.lower() for t in tech.tags]
-                and language.lower() not in tech.description.lower()
+            if target_language and (
+                target_language not in [t.lower() for t in tech.tags]
+                and target_language not in tech.description.lower()
             ):
                 # This is a heuristic as language info might not be explicit in tags
                 # But sometimes tags include 'swift', 'objc'
