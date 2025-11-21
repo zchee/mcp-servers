@@ -5,6 +5,8 @@ from typing import Any
 
 from apple_docs.types.wwdc import CodeExample, TopicInfo, WWDCVideo
 from apple_docs.utils.wwdc_data_source import (
+    get_videos_by_topic,
+    get_videos_by_year,
     load_all_videos,
     load_global_metadata,
     load_video_data,
@@ -21,13 +23,19 @@ async def load_videos_data(video_files: list[str]) -> list[WWDCVideo]:
     Returns:
         List of WWDCVideo objects.
     """
+    sem = asyncio.Semaphore(20)
+
+    async def load_with_sem(year: str, video_id: str) -> WWDCVideo:
+        async with sem:
+            return await load_video_data(year, video_id)
+
     tasks: list[Awaitable[WWDCVideo]] = []
     for file_path in video_files:
         # Extract year and video ID from filename (e.g., "videos/2024-10015.json")
         match = re.search(r"(\d{4})-(\d+)\.json$", file_path)
         if match:
             year, video_id = match.groups()
-            tasks.append(load_video_data(year, video_id))
+            tasks.append(load_with_sem(year, video_id))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     videos: list[WWDCVideo] = []
@@ -53,14 +61,13 @@ async def list_wwdc_videos(
         Formatted string containing the list of videos.
     """
     try:
-        # Use cached all videos list for better performance
-        all_videos = await load_all_videos()
+        if year and year != "all":
+            all_videos = await get_videos_by_year(year)
+        else:
+            all_videos = await load_all_videos()
 
         # Apply filters
         filtered_videos = all_videos
-
-        if year and year != "all":
-            filtered_videos = [v for v in filtered_videos if v["year"] == year]
 
         if topic:
             topic_lower = topic.lower()
@@ -110,14 +117,14 @@ async def search_wwdc_content(
         query_lower = query.lower()
         results: list[dict[str, Any]] = []
 
-        # Pre-filter using cached all videos list
-        all_videos = await load_all_videos()
+        if year and year != "all":
+            all_videos = await get_videos_by_year(year)
+        else:
+            all_videos = await load_all_videos()
+
         potential_videos: list[WWDCVideo] = []  # Using WWDCVideo type as it's what load_all_videos returns
 
         for v in all_videos:
-            if year and v["year"] != year:
-                continue
-
             title_match = query_lower in v.get("title", "").lower()
             topic_match = any(query_lower in t.lower() for t in v.get("topics", []))
 
@@ -152,7 +159,7 @@ async def search_wwdc_content(
             # Search transcript
             transcript = video.get("transcript")
             if search_in in ["transcript", "both"] and transcript:
-                transcript_matches = search_in_transcript(transcript["fullText"], query_lower)
+                transcript_matches = await asyncio.to_thread(search_in_transcript, transcript["fullText"], query_lower)
                 for m in transcript_matches:
                     matches.append({
                         "type": "transcript",
@@ -163,7 +170,7 @@ async def search_wwdc_content(
             # Search code
             code_examples: list[CodeExample] | None = video.get("codeExamples")
             if search_in in ["code", "both"] and code_examples:
-                code_matches = search_in_code(code_examples, query_lower, language)
+                code_matches = await asyncio.to_thread(search_in_code, code_examples, query_lower, language)
                 for m in code_matches:
                     matches.append({"type": "code", "context": m["context"], "timestamp": m.get("timestamp")})
 
@@ -225,16 +232,16 @@ async def get_wwdc_code_examples(
     try:
         code_examples: list[dict[str, Any]] = []
 
-        # Pre-filter using cached all videos list
-        all_videos = await load_all_videos()
+        if year and year != "all":
+            all_videos = await get_videos_by_year(year)
+        else:
+            all_videos = await load_all_videos()
+
         potential_videos: list[WWDCVideo] = []
 
         topic_lower = topic.lower() if topic else None
 
         for v in all_videos:
-            if year and v["year"] != year:
-                continue
-
             if not v.get("hasCode"):
                 continue
 
@@ -324,28 +331,27 @@ async def browse_wwdc_topics(
         if not topic:
             return f'Topic "{topic_id}" not found. Available topics: {", ".join(t["id"] for t in metadata["topics"])}'
 
-        content = f"# {topic['name']}\n\n"
-        content += f"**Topic ID:** {topic['id']}\n"
-        content += f"**URL:** [{topic['url']}]({topic['url']})\n\n"
+        parts: list[str] = [f"# {topic['name']}\n\n"]
+        parts.append(f"**Topic ID:** {topic['id']}\n")
+        parts.append(f"**URL:** [{topic['url']}]({topic['url']})\n\n")
 
         if include_videos:
             try:
-                all_videos = await load_all_videos()
                 topic_name = topic["name"]
+                videos_by_topic = await get_videos_by_topic(topic_name)
 
                 videos_to_show: list[WWDCVideo] = []
-                for v in all_videos:
+                for v in videos_by_topic:
                     if year and year != "all" and v["year"] != year:
                         continue
-                    if topic_name in v.get("topics", []):
-                        videos_to_show.append(v)
+                    videos_to_show.append(v)
 
                 videos_to_show = videos_to_show[:limit]
 
-                content += f"## Videos ({len(videos_to_show)})\n\n"
+                parts.append(f"## Videos ({len(videos_to_show)})\n\n")
 
                 if not videos_to_show:
-                    content += "No videos found for this topic.\n"
+                    parts.append("No videos found for this topic.\n")
                 else:
                     # Group by year
                     videos_by_year: dict[str, list[WWDCVideo]] = {}  # Changed type to WWDCVideo
@@ -356,9 +362,9 @@ async def browse_wwdc_topics(
                         videos_by_year[y].append(video)
 
                     for y in sorted(videos_by_year.keys(), key=lambda x: int(x), reverse=True):
-                        content += f"### WWDC{y}\n\n"
+                        parts.append(f"### WWDC{y}\n\n")
                         for video in videos_by_year[y]:
-                            content += f"- [{video['title']}]({video['url']})"
+                            parts.append(f"- [{video['title']}]({video['url']})")
 
                             features: list[str] = []
                             if video.get("hasTranscript"):
@@ -367,14 +373,14 @@ async def browse_wwdc_topics(
                                 features.append("Code")
 
                             if features:
-                                content += f" | {' | '.join(features)}"
-                            content += "\n"
-                        content += "\n"
+                                parts.append(f" | {' | '.join(features)}")
+                            parts.append("\n")
+                        parts.append("\n")
 
             except Exception as e:
-                content += f"Error loading topic videos: {str(e)}\n"
+                parts.append(f"Error loading topic videos: {str(e)}\n")
 
-        return content
+        return "".join(parts)
 
     except Exception as e:
         return f"Error: Failed to browse WWDC topics: {str(e)}"
@@ -450,7 +456,7 @@ def format_video_list(videos: list[WWDCVideo], year: str | None, topic: str | No
     if not videos:
         return "No WWDC videos found matching the criteria."
 
-    content = "# WWDC Video List\n\n"
+    parts: list[str] = ["# WWDC Video List\n\n"]
 
     filters: list[str] = []
     if year and year != "all":
@@ -461,9 +467,9 @@ def format_video_list(videos: list[WWDCVideo], year: str | None, topic: str | No
         filters.append(f"Has Code: {'Yes' if has_code else 'No'}")
 
     if filters:
-        content += f"**Filter Conditions:** {', '.join(filters)}\n\n"
+        parts.append(f"**Filter Conditions:** {', '.join(filters)}\n\n")
 
-    content += f"**Found {len(videos)} videos**\n\n"
+    parts.append(f"**Found {len(videos)} videos**\n\n")
 
     videos_by_year: dict[str, list[WWDCVideo]] = {}
     for video in videos:
@@ -473,9 +479,9 @@ def format_video_list(videos: list[WWDCVideo], year: str | None, topic: str | No
         videos_by_year[y].append(video)
 
     for y in sorted(videos_by_year.keys(), key=lambda x: int(x), reverse=True):
-        content += f"## WWDC{y}\n\n"
+        parts.append(f"## WWDC{y}\n\n")
         for video in videos_by_year[y]:
-            content += f"### [{video['title']}]({video['url']})\n"
+            parts.append(f"### [{video['title']}]({video['url']})\n")
 
             metadata: list[str] = []
             if video.get("duration"):
@@ -489,15 +495,15 @@ def format_video_list(videos: list[WWDCVideo], year: str | None, topic: str | No
                 metadata.append("Code Examples")
 
             if metadata:
-                content += f"*{' | '.join(metadata)}*\n"
+                parts.append(f"*{' | '.join(metadata)}*\n")
 
             topics = video.get("topics")
             if topics:
-                content += f"**Topics:** {', '.join(topics)}\n"
+                parts.append(f"**Topics:** {', '.join(topics)}\n")
 
-            content += "\n"
+            parts.append("\n")
 
-    return content
+    return "".join(parts)
 
 
 def format_search_results(results: list[dict[str, Any]], query: str, search_in: str) -> str:
@@ -516,25 +522,25 @@ def format_search_results(results: list[dict[str, Any]], query: str, search_in: 
         scope = "code" if search_in == "code" else "transcript" if search_in == "transcript" else "content"
         return f'No {scope} found containing "{query}".'
 
-    content = "# WWDC Content Search Results\n\n"
-    content += f'**Search Query:** "{query}"\n'
+    parts: list[str] = ["# WWDC Content Search Results\n\n"]
+    parts.append(f'**Search Query:** "{query}"\n')
     scope_str = "Code" if search_in == "code" else "Transcript" if search_in == "transcript" else "All Content"
-    content += f"**Search Scope:** {scope_str}\n"
-    content += f"**Found {len(results)} related videos**\n\n"
+    parts.append(f"**Search Scope:** {scope_str}\n")
+    parts.append(f"**Found {len(results)} related videos**\n\n")
 
     for result in results:
         video = result["video"]
-        content += f"## [{video['title']}]({video['url']})\n"
-        content += f"*WWDC{video['year']} | {len(result['matches'])} matches*\n\n"
+        parts.append(f"## [{video['title']}]({video['url']})\n")
+        parts.append(f"*WWDC{video['year']} | {len(result['matches'])} matches*\n\n")
 
         for match in result["matches"]:
-            content += f"**{'Code' if match['type'] == 'code' else 'Transcript'}**"
+            parts.append(f"**{'Code' if match['type'] == 'code' else 'Transcript'}**")
             if match.get("timestamp"):
-                content += f" ({match['timestamp']})"
-            content += "\n"
-            content += f"> {match['context']}\n\n"
+                parts.append(f" ({match['timestamp']})")
+            parts.append("\n")
+            parts.append(f"> {match['context']}\n\n")
 
-    return content
+    return "".join(parts)
 
 
 def format_video_detail(video: WWDCVideo, include_transcript: bool, include_code: bool) -> str:
@@ -549,70 +555,70 @@ def format_video_detail(video: WWDCVideo, include_transcript: bool, include_code
     Returns:
         Formatted markdown string.
     """
-    content = f"# {video['title']}\n\n"
-    content += f"**WWDC{video['year']}** | [Watch Video]({video['url']})\n\n"
+    parts: list[str] = [f"# {video['title']}\n\n"]
+    parts.append(f"**WWDC{video['year']}** | [Watch Video]({video['url']})\n\n")
 
     if video.get("duration"):
-        content += f"**Duration:** {video['duration']}\n"
+        parts.append(f"**Duration:** {video['duration']}\n")
     speakers = video.get("speakers")
     if speakers:
-        content += f"**Speakers:** {', '.join(speakers)}\n"
+        parts.append(f"**Speakers:** {', '.join(speakers)}\n")
     topics = video.get("topics")
     if topics:
-        content += f"**Topics:** {', '.join(topics)}\n"
+        parts.append(f"**Topics:** {', '.join(topics)}\n")
 
     resources = video.get("resources", {})
     if resources.get("hdVideo") or resources.get("sdVideo") or resources.get("resourceLinks"):
-        content += "\n**Resources:**\n"
+        parts.append("\n**Resources:**\n")
         if resources.get("hdVideo"):
-            content += f"- [HD Video]({resources['hdVideo']})\n"
+            parts.append(f"- [HD Video]({resources['hdVideo']})\n")
         if resources.get("sdVideo"):
-            content += f"- [SD Video]({resources['sdVideo']})\n"
+            parts.append(f"- [SD Video]({resources['sdVideo']})\n")
         resource_links = resources.get("resourceLinks")
         if resource_links:
             for link in resource_links:
-                content += f"- [{link['title']}]({link['url']})\n"
+                parts.append(f"- [{link['title']}]({link['url']})\n")
 
     chapters = video.get("chapters")
     if chapters:
-        content += "\n## Chapters\n\n"
+        parts.append("\n## Chapters\n\n")
         for chapter in chapters:
-            content += f"- **{chapter['timestamp']}** {chapter['title']}\n"
+            parts.append(f"- **{chapter['timestamp']}** {chapter['title']}\n")
 
     if include_transcript and video.get("transcript"):
-        content += "\n## Transcript\n\n"
+        parts.append("\n## Transcript\n\n")
         transcript = video["transcript"]
         if transcript and transcript.get("segments"):
             for segment in transcript["segments"]:
-                content += f"**{segment['timestamp']}**\n"
-                content += f"{segment['text']}\n\n"
+                parts.append(f"**{segment['timestamp']}**\n")
+                parts.append(f"{segment['text']}\n\n")
         elif transcript:
-            content += transcript.get("fullText", "")
+            parts.append(transcript.get("fullText", ""))
 
     code_examples = video.get("codeExamples")
     if include_code and code_examples:
-        content += "\n## Code Examples\n\n"
+        parts.append("\n## Code Examples\n\n")
         for i, example in enumerate(code_examples):
             title = example.get("title") or f"Code Example {i + 1}"
-            content += f"### {title}"
+            parts.append(f"### {title}")
             if example.get("timestamp"):
-                content += f" ({example['timestamp']})"
-            content += "\n\n"
+                parts.append(f" ({example['timestamp']})")
+            parts.append("\n\n")
 
-            content += f"```{example['language']}\n"
-            content += example["code"]
-            content += "\n```\n\n"
+            parts.append(f"```{example['language']}\n")
+            parts.append(example["code"])
+            parts.append("\n```\n\n")
 
             if example.get("context"):
-                content += f"*{example['context']}*\n\n"
+                parts.append(f"*{example['context']}*\n\n")
 
     related_videos = video.get("relatedVideos")
     if related_videos:
-        content += "\n## Related Videos\n\n"
+        parts.append("\n## Related Videos\n\n")
         for related in related_videos:
-            content += f"- [{related['title']}]({related['url']}) (WWDC{related['year']})\n"
+            parts.append(f"- [{related['title']}]({related['url']}) (WWDC{related['year']})\n")
 
-    return content
+    return "".join(parts)
 
 
 def format_code_examples(
@@ -633,7 +639,7 @@ def format_code_examples(
     if not examples:
         return "No code examples found matching the criteria."
 
-    content = "# WWDC Code Examples\n\n"
+    parts: list[str] = ["# WWDC Code Examples\n\n"]
 
     filters: list[str] = []
     if framework:
@@ -644,9 +650,9 @@ def format_code_examples(
         filters.append(f"Language: {language}")
 
     if filters:
-        content += f"**Filter Conditions:** {', '.join(filters)}\n\n"
+        parts.append(f"**Filter Conditions:** {', '.join(filters)}\n\n")
 
-    content += f"**Found {len(examples)} code examples**\n\n"
+    parts.append(f"**Found {len(examples)} code examples**\n\n")
 
     examples_by_language: dict[str, list[dict[str, Any]]] = {}
     for ex in examples:
@@ -656,17 +662,17 @@ def format_code_examples(
         examples_by_language[lang].append(ex)
 
     for lang in examples_by_language:
-        content += f"## {lang.capitalize()}\n\n"
+        parts.append(f"## {lang.capitalize()}\n\n")
         for example in examples_by_language[lang]:
-            content += f"### {example.get('title') or 'Code Example'}\n"
-            content += f"*From: [{example['videoTitle']}]({example['videoUrl']}) (WWDC{example['year']})*"
+            parts.append(f"### {example.get('title') or 'Code Example'}\n")
+            parts.append(f"*From: [{example['videoTitle']}]({example['videoUrl']}) (WWDC{example['year']})*")
 
             if example.get("timestamp"):
-                content += f" *@ {example['timestamp']}*"
-            content += "\n\n"
+                parts.append(f" *@ {example['timestamp']}*")
+            parts.append("\n\n")
 
-            content += f"```{example['language']}\n"
-            content += example["code"]
-            content += "\n```\n\n"
+            parts.append(f"```{example['language']}\n")
+            parts.append(example["code"])
+            parts.append("\n```\n\n")
 
-    return content
+    return "".join(parts)
