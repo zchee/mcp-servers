@@ -1,8 +1,14 @@
+import contextlib
 import re
 from typing import Any
 
 from apple_docs.utils.constants import ApiLimits, AppleUrls, ProcessingLimits
 from apple_docs.utils.http_client import http_client
+
+
+# Cache for parsed framework symbols
+_framework_symbols_cache: dict[str, list[FrameworkSymbol]] = {}
+FRAMEWORK_CACHE_SIZE = 50
 
 
 class FrameworkSymbol:
@@ -33,6 +39,24 @@ class FrameworkSymbol:
         }
 
 
+def _prune_framework_cache() -> None:
+    """Ensure cache size stays within limits."""
+    if len(_framework_symbols_cache) >= FRAMEWORK_CACHE_SIZE:
+        with contextlib.suppress(StopIteration):
+            _framework_symbols_cache.pop(next(iter(_framework_symbols_cache)))
+
+
+async def _fetch_framework_data(framework: str) -> dict[str, Any]:
+    """Fetch framework data, trying multiple URL patterns."""
+    index_url = f"{AppleUrls.TUTORIALS_DATA}index/{framework.lower()}"
+    try:
+        return await http_client.get_json(index_url)
+    except Exception:
+        # Try with 'documentation' prefix if direct index fails
+        index_url = f"{AppleUrls.TUTORIALS_DATA}documentation/{framework.lower()}"
+        return await http_client.get_json(index_url)
+
+
 async def search_framework_symbols(
     framework: str,
     symbol_type: str = "all",
@@ -54,21 +78,25 @@ async def search_framework_symbols(
         Formatted string containing search results.
     """
     try:
-        index_url = f"{AppleUrls.TUTORIALS_DATA}index/{framework.lower()}"
-
-        # TODO(zchee): Implement caching
-
-        try:
-            data = await http_client.get_json(index_url)
-        except Exception:
-            # Try with 'documentation' prefix if direct index fails
-            index_url = f"{AppleUrls.TUTORIALS_DATA}documentation/{framework.lower()}"
-            data = await http_client.get_json(index_url)
-
-        all_symbols = parse_index_items(data.get("interfaceLanguages", {}).get(language, []), language)
+        cache_key = f"{framework.lower()}-{language}"
+        if cache_key in _framework_symbols_cache:
+            all_symbols = _framework_symbols_cache[cache_key]
+        else:
+            data = await _fetch_framework_data(framework)
+            all_symbols = parse_index_items(data.get("interfaceLanguages", {}).get(language, []), language)
+            _prune_framework_cache()
+            _framework_symbols_cache[cache_key] = all_symbols
 
         # Filter symbols
-        symbols = [s for s in all_symbols if matches_criteria(s, symbol_type, name_pattern)]
+        target_type = symbol_type.lower()
+        pattern_obj: re.Pattern[str] | str | None = None
+        if name_pattern:
+            try:
+                pattern_obj = re.compile(name_pattern, re.IGNORECASE)
+            except re.error:
+                pattern_obj = name_pattern.lower()
+
+        symbols = [s for s in all_symbols if matches_criteria(s, target_type, pattern_obj)]
 
         # Format results
         parts: list[str] = [f"# {framework} Framework Symbols\n\n"]
@@ -82,8 +110,7 @@ async def search_framework_symbols(
         if not symbols:
             parts.append("No symbols found matching your criteria.\n")
             # Suggest collections if any
-            index_items = data.get("interfaceLanguages", {}).get(language, [])
-            collections = find_collections(index_items)
+            collections = [s for s in all_symbols if s.type == "collection"]
             if collections:
                 parts.append("\n## Try exploring these collections:\n\n")
                 for col in collections[: ProcessingLimits.MAX_COLLECTIONS_TO_SHOW]:
@@ -144,65 +171,40 @@ def parse_index_items(items_data: list[dict[str, Any]], language: str) -> list[F
     return symbols
 
 
-def matches_criteria(symbol: FrameworkSymbol, symbol_type: str, name_pattern: str | None) -> bool:
+def matches_criteria(
+    symbol: FrameworkSymbol, target_type: str, pattern_obj: re.Pattern[str] | str | None
+) -> bool:
     """
     Check if a symbol matches the search criteria.
 
     Args:
         symbol: The symbol to check.
-        symbol_type: The type filter.
-        name_pattern: The name pattern filter.
+        target_type: The target type filter (lowercase).
+        pattern_obj: The compiled regex pattern or string to match.
 
     Returns:
         True if the symbol matches, False otherwise.
     """
-    if symbol_type != "all" and symbol.type.lower() != symbol_type.lower():
+    if target_type != "all" and symbol.type.lower() != target_type:
         return False
 
-    return not (name_pattern and not matches_pattern(symbol.title, name_pattern))
+    return not (pattern_obj and not matches_pattern(symbol.title, pattern_obj))
 
 
-def matches_pattern(text: str, pattern: str) -> bool:
+def matches_pattern(text: str, pattern_obj: re.Pattern[str] | str) -> bool:
     """
-    Check if text matches a regex pattern.
+    Check if text matches a regex pattern or string.
 
     Args:
         text: The text to check.
-        pattern: The regex pattern.
+        pattern_obj: The compiled regex pattern or string.
 
     Returns:
         True if matches, False otherwise.
     """
-    try:
-        return re.search(pattern, text, re.IGNORECASE) is not None
-    except re.error:
-        return text.lower().find(pattern.lower()) != -1
-
-
-def find_collections(items_data: list[dict[str, Any]]) -> list[FrameworkSymbol]:
-    """
-    Find collection items in the index data.
-
-    Args:
-        items_data: List of item data dictionaries.
-
-    Returns:
-        List of collection FrameworkSymbol objects.
-    """
-    collections: list[FrameworkSymbol] = []
-    for item in items_data:
-        if item.get("type") == "collection":
-            collections.append(
-                FrameworkSymbol(
-                    title=item.get("title", "Unknown"),
-                    path=item.get("path", ""),
-                    type="collection",
-                    language="swift",
-                )
-            )
-        elif item.get("children"):
-            collections.extend(find_collections(item["children"]))
-    return collections
+    if isinstance(pattern_obj, re.Pattern):
+        return pattern_obj.search(text) is not None
+    return text.lower().find(pattern_obj) != -1
 
 
 def pluralize_type(type_name: str) -> str:
