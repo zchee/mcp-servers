@@ -179,3 +179,12 @@ func Instructions(subscription string) string {
 		"truncated=\"true\" means the body was cut to the size limit and original_bytes is the size of the full message data; " +
 		"attributes starting with attr_ are the publisher's message attributes, with every character other than letters, digits and underscores replaced by an underscore."
 }
+
+// InactiveInstructions returns the system-prompt text of a server that does
+// not receive from subscription in this session, so that the model does not
+// wait for events that will never arrive.
+func InactiveInstructions(subscription string) string {
+	return "This Pub/Sub channel is inactive in this session: the server is not receiving from the Google Cloud Pub/Sub subscription " + subscription + ", so no events will arrive from this channel. " +
+		"Either receiving was not enabled for this session, or another session on this machine is receiving from the subscription. " +
+		"Do not wait for or expect channel events from it."
+}

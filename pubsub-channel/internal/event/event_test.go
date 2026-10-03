@@ -310,3 +310,28 @@ func BenchmarkFromMessage(b *testing.B) {
 		})
 	}
 }
+
+func TestInactiveInstructions(t *testing.T) {
+	tests := map[string]struct {
+		subscription string
+	}{
+		"success: names the subscription and says no events arrive": {subscription: "projects/p/subscriptions/alerts"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := InactiveInstructions(tt.subscription)
+			for _, want := range []string{tt.subscription, "inactive in this session", "no events will arrive"} {
+				if !strings.Contains(got, want) {
+					t.Errorf("InactiveInstructions(%q) does not mention %q:\n%s", tt.subscription, want, got)
+				}
+			}
+			// The inactive text must not describe event attributes, which
+			// would suggest that events are coming.
+			for _, unwanted := range []string{KeyMessageID, KeyPublishTime} {
+				if strings.Contains(got, unwanted) {
+					t.Errorf("InactiveInstructions(%q) mentions %q:\n%s", tt.subscription, unwanted, got)
+				}
+			}
+		})
+	}
+}
