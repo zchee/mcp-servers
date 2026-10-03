@@ -48,7 +48,7 @@ With it set, the project is not checked against Google Cloud's project ID
 format, because the emulator accepts any name, such as `local`; every other
 configuration check still applies.
 
-### 3. Install the server
+### 3. Install the server binary
 
 ```sh
 go -C pubsub-channel install .
@@ -56,86 +56,91 @@ go -C pubsub-channel install .
 
 This puts the `pubsub-channel` binary in `$(go env GOBIN)`, or
 `$(go env GOPATH)/bin` when `GOBIN` is unset. That directory must be on the
-`PATH` that Claude Code inherits, or `command` in `mcp.json` must be the
-binary's absolute path. Reinstall after changing the source.
+`PATH` that Claude Code inherits. Installing the plugin does not build the
+binary; reinstall it after changing the source.
 
-The entry runs the installed binary, not `go run`, for two reasons. `go run`
+The plugin runs the installed binary, not `go run`, for two reasons. `go run`
 does not forward `SIGTERM` to the program it builds, so when Claude Code
 restarts the server, the old process can keep running: it holds leased
 messages and competes for the same subscription. And on a cold build cache,
 compiling the gRPC and Pub/Sub dependencies can take longer than Claude Code's
 MCP startup timeout.
 
-### 4. Start Claude Code with the channel
+### 4. Install the plugin
 
-The server entry is in [`mcp.json`](mcp.json) in this directory and is loaded
-only when asked for:
+The repository root is a plugin marketplace
+([`.claude-plugin/marketplace.json`](../.claude-plugin/marketplace.json)) named
+`zchee-mcp-servers`. Its `pubsub-channel` entry is the whole plugin manifest:
+it declares the MCP server and binds a channel to it, so this directory has no
+`plugin.json` and no `.mcp.json`.
 
 ```sh
-export PUBSUB_CHANNEL_SUBSCRIPTION=projects/my-proj/subscriptions/alerts
-# or: export PUBSUB_CHANNEL_PROJECT=my-proj PUBSUB_CHANNEL_SUBSCRIPTION=alerts
-claude --mcp-config pubsub-channel/mcp.json --dangerously-load-development-channels server:pubsub-channel
+claude plugin marketplace add zchee/mcp-servers   # or a local checkout: ./
+claude plugin install pubsub-channel@zchee-mcp-servers
 ```
 
-```json
-{
-  "mcpServers": {
-    "pubsub-channel": {
-      "type": "stdio",
-      "command": "pubsub-channel",
-      "args": [],
-      "env": {
-        "PUBSUB_CHANNEL_PROJECT": "${PUBSUB_CHANNEL_PROJECT:-}",
-        "PUBSUB_CHANNEL_SUBSCRIPTION": "${PUBSUB_CHANNEL_SUBSCRIPTION:-}"
-      }
-    }
-  }
-}
+When the plugin is enabled, Claude Code asks for the channel's configuration:
+
+| Option | Required | Passed to the server as |
+|---|---|---|
+| Subscription | yes | `PUBSUB_CHANNEL_SUBSCRIPTION` |
+| Project | only with a bare subscription ID | `PUBSUB_CHANNEL_PROJECT` |
+
+The other settings in [Flags](#flags) keep their defaults; the rate limit can
+be changed through `PUBSUB_CHANNEL_MAX_RATE` and `PUBSUB_CHANNEL_MAX_BURST` in
+the environment Claude Code is started from.
+
+### 5. Start Claude Code with the channel
+
+```sh
+claude --dangerously-load-development-channels plugin:pubsub-channel@zchee-mcp-servers
 ```
 
-The entry is deliberately not in a project `.mcp.json`. Claude Code starts
-every server in a project `.mcp.json` for every session opened in the
-repository, whether or not that session loads it as a channel. With the
-subscription variable exported, each such session would pull and acknowledge
-messages that Claude Code then drops, because only a session started with the
-development flag registers the server as a channel; and several sessions would
-split one subscription between them, each seeing only part of the messages.
-
-The empty defaults (`:-`) make an unset variable reach the server as an empty
-value, so it exits with `a subscription is required` instead of receiving the
-literal text `${PUBSUB_CHANNEL_SUBSCRIPTION}`.
-
-Custom channels are not on the research-preview allowlist, which is why the
-development flag is needed. Claude Code shows a warning dialog for development
-channels. After that, the startup banner shows `Channels (experimental)
-messages from server:pubsub-channel inject directly in this session`. If the
+A channel from a marketplace other than `claude-plugins-official` is not on
+the research-preview allowlist, which is why the development flag is needed.
+Claude Code shows a warning dialog for development channels, and the startup
+banner then names the channel as injecting messages into the session. If an
 event does not arrive, start with `--debug` and read
 `~/.claude/debug/<session-id>.txt`; the server's stderr is there.
-
-Not yet verified: that `--dangerously-load-development-channels` accepts a
-server defined through `--mcp-config` (it was written against servers from
-`.mcp.json`), and that `--mcp-config` expands `${VAR:-}` references the way
-`.mcp.json` does. Both are on the [manual smoke test](#manual-smoke-test) list.
 
 On claude.ai Team and Enterprise plans, the `channelsEnabled` managed setting
 must be `true` for any channel to deliver messages. The development flag skips
 only the plugin allowlist, not `channelsEnabled`; with the setting off, the
 startup notice reports the channel as blocked by organization policy.
 
-To run it without the development flag, an admin can package the channel as a
-plugin in an internal marketplace and allowlist it in managed settings:
+To run without the development flag, an admin allowlists the plugin in managed
+settings:
 
 ```json
 {
   "channelsEnabled": true,
   "allowedChannelPlugins": [
-    { "marketplace": "<marketplace>", "plugin": "<plugin>" }
+    { "marketplace": "zchee-mcp-servers", "plugin": "pubsub-channel" }
   ]
 }
 ```
 
-It then runs under `claude --channels plugin:<plugin>@<marketplace>`. Packaging
-as a plugin is not part of this module.
+It then runs under `claude --channels plugin:pubsub-channel@zchee-mcp-servers`.
+
+**Sessions that do not load the channel.** The server cannot tell whether the
+session registered it as a channel. If Claude Code starts an enabled plugin's
+MCP server in a session started without the channel flag, that session pulls
+and acknowledges messages that Claude Code then drops, and several sessions
+split one subscription between them, each seeing only part of the messages.
+Until the [manual smoke test](#manual-smoke-test) shows otherwise, keep the
+plugin enabled only where every session is started with the channel flag: for
+example install it with `--scope local` in a dedicated working directory, or
+disable it (`claude plugin disable pubsub-channel@zchee-mcp-servers`) when not
+in use.
+
+Not yet verified, all on the manual smoke test list: that the plugin installs
+and registers as a channel from this marketplace entry alone; that an empty
+Project option reaches the server as an empty value rather than the literal
+`${user_config.project}` (the server rejects an unexpanded `${...}` at
+startup); the exact `source` value of the `<channel>` tag for a plugin channel,
+which may be prefixed with the plugin name instead of the bare
+`pubsub-channel` shown in this document; and whether a session started without
+the channel flag starts the server.
 
 ## Flags
 
@@ -273,11 +278,13 @@ test list.
 
 Run after installing, against a dedicated test subscription:
 
-1. Start Claude Code with the command from
-   [Start Claude Code with the channel](#4-start-claude-code-with-the-channel).
-   Expected: the startup notice `Channels (experimental) messages from
-   server:pubsub-channel inject directly in this session`. This also confirms
-   that the development flag accepts a server from `--mcp-config`.
+1. Install the plugin, leave the Project option empty with a full
+   subscription name, and start Claude Code with the command from
+   [Start Claude Code with the channel](#5-start-claude-code-with-the-channel).
+   Expected: the configuration dialog asks for Subscription and Project, and
+   the startup notice names the channel as injecting messages into the
+   session. This confirms that the marketplace entry alone is a loadable
+   plugin and that an empty option is passed as an empty value.
 2. Confirm the server connected at all: `/mcp` lists `pubsub-channel` as
    connected. The server refuses `server/discover` at protocol `2026-07-28`
    (Claude Code would not register it as a channel at that revision), so this
@@ -292,6 +299,10 @@ Run after installing, against a dedicated test subscription:
    attribute value does not create a `y` attribute.
 5. Quit Claude Code and check that no `pubsub-channel` process is left
    (`pgrep -fl pubsub-channel`).
+6. With the plugin still enabled, start a session without the channel flag
+   and run `pgrep -fl pubsub-channel`. If a process is running, that session
+   is pulling and acknowledging messages it will never show; keep the plugin
+   disabled outside channel sessions.
 
 ## Development
 
