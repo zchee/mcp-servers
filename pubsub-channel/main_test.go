@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +22,7 @@ import (
 
 	"github.com/zchee/mcp-servers/pubsub-channel/internal/channel"
 	"github.com/zchee/mcp-servers/pubsub-channel/internal/event"
+	"github.com/zchee/mcp-servers/pubsub-channel/internal/lock"
 	"github.com/zchee/mcp-servers/pubsub-channel/internal/testsupport"
 )
 
@@ -165,6 +169,48 @@ func TestParseConfig(t *testing.T) {
 				c.project = "p"
 				c.subscription = "projects/p/subscriptions/alerts"
 				c.instructions = event.Instructions(c.subscription)
+			}),
+		},
+		"success: receiving is disabled by default": {
+			args: []string{"-subscription", fullName},
+			want: defaults,
+		},
+		"success: enable environment variable turns receiving on": {
+			args: []string{"-subscription", fullName},
+			env:  map[string]string{envEnable: "1"},
+			want: with(func(c *config) { c.enable = true }),
+		},
+		"success: enable environment variable false keeps receiving off": {
+			args: []string{"-subscription", fullName},
+			env:  map[string]string{envEnable: "false"},
+			want: defaults,
+		},
+		"success: enable flag turns receiving on": {
+			args: []string{"-subscription", fullName, "-enable"},
+			want: with(func(c *config) { c.enable = true }),
+		},
+		"success: enable flag false overrides the environment variable": {
+			args: []string{"-subscription", fullName, "-enable=false"},
+			env:  map[string]string{envEnable: "true"},
+			want: defaults,
+		},
+		"success: enable flag overrides a malformed environment value": {
+			args: []string{"-subscription", fullName, "-enable"},
+			env:  map[string]string{envEnable: "yes"},
+			want: with(func(c *config) { c.enable = true }),
+		},
+		"success: malformed enable environment value keeps receiving off with a warning": {
+			args: []string{"-subscription", fullName},
+			env:  map[string]string{envEnable: "yes"},
+			want: with(func(c *config) {
+				c.enableWarning = `PUBSUB_CHANNEL_ENABLE="yes" is not a boolean; receiving stays disabled`
+			}),
+		},
+		"success: unexpanded enable placeholder keeps receiving off with a warning": {
+			args: []string{"-subscription", fullName},
+			env:  map[string]string{envEnable: "${PUBSUB_CHANNEL_ENABLE:-}"},
+			want: with(func(c *config) {
+				c.enableWarning = `PUBSUB_CHANNEL_ENABLE="${PUBSUB_CHANNEL_ENABLE:-}" is not a boolean; receiving stays disabled`
 			}),
 		},
 		"error: missing subscription": {
@@ -346,7 +392,7 @@ func TestRunConfigurationError(t *testing.T) {
 			client, transport := testsupport.NewClient(t)
 			var stderr syncBuffer
 
-			code := run(t.Context(), tt.args, envMap(tt.env), transport, &stderr)
+			code := run(t.Context(), tt.args, envMap(tt.env), transport, &stderr, t.TempDir())
 
 			if code != tt.wantCode {
 				t.Errorf("run(%q) = %d, want %d; stderr:\n%s", tt.args, code, tt.wantCode, stderr.String())
@@ -366,7 +412,7 @@ func TestRunConfigurationError(t *testing.T) {
 	}
 }
 
-// started is a run of the whole server against the Pub/Sub emulator.
+// started is a run of the whole server.
 type started struct {
 	client *testsupport.Client
 	stderr *syncBuffer
@@ -374,15 +420,20 @@ type started struct {
 	code   chan int
 }
 
-// startRun runs the server with args against the emulator, under a context
-// the test can cancel to simulate SIGINT or SIGTERM.
-func startRun(t *testing.T, args []string) *started {
+// startServer runs the server with args, env and lockDir, connecting to Pub/Sub
+// with opts, under a context the test can cancel to simulate SIGINT or SIGTERM.
+// lockDir must belong to the test, so that no test touches the lock files of
+// servers running outside it.
+func startServer(t *testing.T, args []string, env map[string]string, lockDir string, opts []option.ClientOption) *started {
 	t.Helper()
-	_, opts := testsupport.EmulatorProject(t)
+	// An empty lockDir selects the real default lock directory.
+	if lockDir == "" {
+		t.Fatal("startServer needs a lock directory that belongs to the test")
+	}
 	client, transport := testsupport.NewClient(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	s := &started{client: client, stderr: &syncBuffer{}, cancel: cancel, code: make(chan int, 1)}
-	go func() { s.code <- run(ctx, args, envMap(nil), transport, s.stderr, opts...) }()
+	go func() { s.code <- run(ctx, args, envMap(env), transport, s.stderr, lockDir, opts...) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -392,6 +443,25 @@ func startRun(t *testing.T, args []string) *started {
 		}
 	})
 	return s
+}
+
+// startRun runs the server with args and lockDir against the emulator.
+func startRun(t *testing.T, args []string, lockDir string) *started {
+	t.Helper()
+	_, opts := testsupport.EmulatorProject(t)
+	return startServer(t, args, nil, lockDir, opts)
+}
+
+// waitForLog waits until stderr contains substr.
+func (s *started) waitForLog(t *testing.T, substr string) {
+	t.Helper()
+	deadline := time.Now().Add(testsupport.LineTimeout)
+	for !strings.Contains(s.stderr.String(), substr) {
+		if time.Now().After(deadline) {
+			t.Fatalf("stderr has no %q within %v; stderr:\n%s", substr, testsupport.LineTimeout, s.stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // exitCode waits for run to return.
@@ -482,7 +552,7 @@ func TestRunAgainstEmulator(t *testing.T) {
 			} else {
 				f = testsupport.NewFixture(t, client)
 			}
-			s := startRun(t, append([]string{"-subscription", f.Subscription}, tt.extraArgs...))
+			s := startRun(t, append([]string{"-enable", "-subscription", f.Subscription}, tt.extraArgs...), t.TempDir())
 
 			result := s.handshake(t)
 			if v, ok := result["protocolVersion"].(string); !ok {
@@ -544,9 +614,6 @@ func TestRunExitsWhilePubSubUnreachable(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			client, transport := testsupport.NewClient(t)
-			ctx, cancel := context.WithCancel(t.Context())
-			s := &started{client: client, stderr: &syncBuffer{}, cancel: cancel, code: make(chan int, 1)}
 			// Port 1 on the loopback address is closed, so every connection
 			// attempt is refused at once.
 			opts := []option.ClientOption{
@@ -554,28 +621,12 @@ func TestRunExitsWhilePubSubUnreachable(t *testing.T) {
 				option.WithoutAuthentication(),
 				option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
 			}
-			go func() {
-				s.code <- run(ctx, []string{"-subscription", "projects/test-project/subscriptions/unreachable"}, envMap(nil), transport, s.stderr, opts...)
-			}()
-			t.Cleanup(func() {
-				cancel()
-				select {
-				case <-s.code:
-				case <-time.After(15 * time.Second):
-					t.Errorf("run did not return within 15s of the test ending; stderr:\n%s", s.stderr.String())
-				}
-			})
+			s := startServer(t, []string{"-enable", "-subscription", "projects/test-project/subscriptions/unreachable"}, nil, t.TempDir(), opts)
 
 			s.handshake(t)
 			// Receiving starts after the handshake; end the session only once
 			// it has, so the shutdown meets a pull stream that is retrying.
-			deadline := time.Now().Add(testsupport.LineTimeout)
-			for !strings.Contains(s.stderr.String(), "session initialized; receiving") {
-				if time.Now().After(deadline) {
-					t.Fatalf("server did not start receiving within %v; stderr:\n%s", testsupport.LineTimeout, s.stderr.String())
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
+			s.waitForLog(t, "session initialized; receiving")
 			time.Sleep(500 * time.Millisecond) // let the first connection attempts fail
 
 			start := time.Now()
@@ -584,6 +635,397 @@ func TestRunExitsWhilePubSubUnreachable(t *testing.T) {
 			t.Logf("run returned %v after the session ended", time.Since(start))
 			if code != exitOK {
 				t.Errorf("exit code = %d, want %d; stderr:\n%s", code, exitOK, s.stderr.String())
+			}
+		})
+	}
+}
+
+// countingEndpoint listens on a loopback port, closes every connection made to
+// it at once, and returns client options that point Pub/Sub at it together with
+// the number of connections accepted so far.
+func countingEndpoint(t *testing.T) ([]option.ClientOption, *atomic.Int64) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on loopback: %v", err)
+	}
+	var accepted atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // the listener is closed when the test ends
+			}
+			accepted.Add(1)
+			_ = conn.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-done
+	})
+	return []option.ClientOption{
+		option.WithEndpoint(ln.Addr().String()),
+		option.WithoutAuthentication(),
+		option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+	}, &accepted
+}
+
+// TestRunIdle checks every way the server ends up idle: it completes the
+// handshake with instructions saying no events will arrive, logs why, never
+// connects to Pub/Sub, writes nothing after the handshake, and exits 0 when the
+// client closes stdin. The last case is the control: an enabled server with a
+// free lock does connect, which shows that the connection counter can see the
+// connections the idle cases must not make. It needs no container runtime.
+func TestRunIdle(t *testing.T) {
+	const subscription = "projects/test-project/subscriptions/idle"
+
+	tests := map[string]struct {
+		args []string
+		env  map[string]string
+		// holdLock takes the subscription lock in the server's lock directory
+		// before the server starts, as another process would.
+		holdLock bool
+		// wantLogs must each appear exactly once on stderr.
+		wantLogs []string
+		// wantReceiving expects the server to receive instead of staying idle.
+		wantReceiving bool
+	}{
+		"success: receiving is disabled by default": {
+			args:     []string{"-subscription", subscription},
+			wantLogs: []string{"receiving is disabled; to receive, set PUBSUB_CHANNEL_ENABLE=1 or pass -enable"},
+		},
+		"success: an unexpanded enable placeholder is reported once and leaves the server idle": {
+			args: []string{"-subscription", subscription},
+			env:  map[string]string{envEnable: "${PUBSUB_CHANNEL_ENABLE:-}"},
+			wantLogs: []string{
+				`PUBSUB_CHANNEL_ENABLE=\"${PUBSUB_CHANNEL_ENABLE:-}\" is not a boolean; receiving stays disabled`,
+				"receiving is disabled",
+			},
+		},
+		"success: custom instructions are replaced while idle": {
+			args:     []string{"-subscription", subscription, "-instructions", "events are coming"},
+			wantLogs: []string{"receiving is disabled"},
+		},
+		"success: enabled while another process holds the lock": {
+			args:     []string{"-enable", "-subscription", subscription},
+			holdLock: true,
+			wantLogs: []string{
+				"another pubsub-channel process on this machine is receiving from " + subscription + "; this server stays idle for its lifetime",
+				"holder=\"pid=" + fmt.Sprint(os.Getpid()) + " started=",
+			},
+		},
+		"success: enabled with a free lock connects to Pub/Sub": {
+			args:          []string{"-enable", "-subscription", subscription},
+			wantLogs:      []string{"session initialized; receiving"},
+			wantReceiving: true,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			lockDir := t.TempDir()
+			if tt.holdLock {
+				l, err := lock.Acquire(lockDir, subscription)
+				if err != nil {
+					t.Fatalf("hold the subscription lock: %v", err)
+				}
+				if err := l.WriteHolder(time.Now(), subscription); err != nil {
+					t.Fatalf("record the lock holder: %v", err)
+				}
+				t.Cleanup(func() { _ = l.Release() })
+			}
+			opts, accepted := countingEndpoint(t)
+			s := startServer(t, tt.args, tt.env, lockDir, opts)
+
+			result := s.handshake(t)
+			for _, want := range tt.wantLogs {
+				s.waitForLog(t, want)
+			}
+
+			if tt.wantReceiving {
+				deadline := time.Now().Add(testsupport.LineTimeout)
+				for accepted.Load() == 0 {
+					if time.Now().After(deadline) {
+						t.Fatalf("enabled server made no connection to Pub/Sub within %v; stderr:\n%s", testsupport.LineTimeout, s.stderr.String())
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			} else {
+				if diff := gocmp.Diff(event.InactiveInstructions(subscription), result["instructions"]); diff != "" {
+					t.Errorf("instructions (-want +got):\n%s", diff)
+				}
+				// No notification, or anything else, follows the handshake.
+				s.client.ExpectSilence(t, time.Second)
+				if n := accepted.Load(); n != 0 {
+					t.Errorf("idle server made %d connections to Pub/Sub, want 0", n)
+				}
+			}
+
+			start := time.Now()
+			s.client.CloseInput()
+			if code := s.exitCode(t, shutdownBound); code != exitOK {
+				t.Errorf("exit code = %d, want %d; stderr:\n%s", code, exitOK, s.stderr.String())
+			}
+			t.Logf("run returned %v after the client closed stdin", time.Since(start))
+
+			stderr := s.stderr.String()
+			for _, want := range tt.wantLogs {
+				if n := strings.Count(stderr, want); n != 1 {
+					t.Errorf("stderr has %q %d times, want once; stderr:\n%s", want, n, stderr)
+				}
+			}
+			if !tt.wantReceiving && strings.Contains(stderr, "session initialized; receiving") {
+				t.Errorf("idle server logged that it is receiving; stderr:\n%s", stderr)
+			}
+		})
+	}
+}
+
+// TestRunLockError checks that an enabled server that cannot take the
+// subscription lock exits 1 with one line naming the subscription before the
+// handshake, instead of receiving without the lock.
+func TestRunLockError(t *testing.T) {
+	const subscription = "projects/test-project/subscriptions/lock-error"
+
+	tests := map[string]struct {
+		// lockDir returns a lock directory that cannot hold the lock file.
+		lockDir func(t *testing.T) string
+		// wantCause is the end of the last stderr line.
+		wantCause string
+	}{
+		"error: lock directory cannot be created under a regular file": {
+			lockDir: func(t *testing.T) string {
+				t.Helper()
+				file := filepath.Join(t.TempDir(), "file")
+				if err := os.WriteFile(file, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return filepath.Join(file, "pubsub-channel")
+			},
+			wantCause: "not a directory",
+		},
+		"error: lock file cannot be created in a read-only directory": {
+			lockDir: func(t *testing.T) string {
+				t.Helper()
+				dir := filepath.Join(t.TempDir(), "read-only")
+				if err := os.Mkdir(dir, 0o500); err != nil {
+					t.Fatal(err)
+				}
+				// t.TempDir cannot remove the directory's parent otherwise.
+				t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+				return dir
+			},
+			wantCause: "permission denied",
+		},
+		"error: lock file is a symbolic link": {
+			lockDir: func(t *testing.T) string {
+				t.Helper()
+				dir := t.TempDir()
+				const content = "not a lock file\n"
+				target := filepath.Join(t.TempDir(), "target")
+				if err := os.WriteFile(target, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, lock.Path(dir, subscription)); err != nil {
+					t.Fatal(err)
+				}
+				// Runs after the server has exited.
+				t.Cleanup(func() {
+					got, err := os.ReadFile(target)
+					if err != nil || string(got) != content {
+						t.Errorf("link target after the run: %q, %v; want %q unchanged", got, err, content)
+					}
+				})
+				return dir
+			},
+			wantCause: "is a symbolic link; refusing to use it as the lock file",
+		},
+		"error: lock file is a hard link to another file": {
+			lockDir: func(t *testing.T) string {
+				t.Helper()
+				dir := t.TempDir()
+				const content = "not a lock file\n"
+				// In dir, so that the link is on the same file system.
+				victim := filepath.Join(dir, "victim")
+				if err := os.WriteFile(victim, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Link(victim, lock.Path(dir, subscription)); err != nil {
+					t.Fatal(err)
+				}
+				// Runs after the server has exited.
+				t.Cleanup(func() {
+					got, err := os.ReadFile(victim)
+					if err != nil || string(got) != content {
+						t.Errorf("linked file after the run: %q, %v; want %q unchanged", got, err, content)
+					}
+				})
+				return dir
+			},
+			wantCause: "has 2 hard links; refusing to use it as the lock file",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			opts, accepted := countingEndpoint(t)
+			s := startServer(t, []string{"-enable", "-subscription", subscription}, nil, tt.lockDir(t), opts)
+
+			if code := s.exitCode(t, shutdownBound); code != exitFailure {
+				t.Errorf("exit code = %d, want %d; stderr:\n%s", code, exitFailure, s.stderr.String())
+			}
+			stderr := strings.TrimRight(s.stderr.String(), "\n")
+			if lines := strings.Split(stderr, "\n"); len(lines) != 1 {
+				t.Errorf("stderr has %d lines, want 1:\n%s", len(lines), stderr)
+			}
+			wantPrefix := "pubsub-channel: refusing to receive from " + subscription + " without the subscription lock: "
+			if !strings.HasPrefix(stderr, wantPrefix) || !strings.HasSuffix(stderr, tt.wantCause) {
+				t.Errorf("stderr = %q, want a line starting with %q and ending with %q", stderr, wantPrefix, tt.wantCause)
+			}
+			// The server exits before the handshake and without connecting.
+			s.client.ExpectSilence(t, 100*time.Millisecond)
+			if n := accepted.Load(); n != 0 {
+				t.Errorf("server made %d connections to Pub/Sub, want 0", n)
+			}
+		})
+	}
+}
+
+// TestRunLockLost checks that a receiving server whose lock file is removed or
+// replaced stops receiving and exits 1 within about one lock check interval,
+// so that it does not keep receiving beside a process that locked a new file
+// at the same path. It also checks that its shutdown leaves the new file's
+// holder text alone. It needs no container runtime.
+func TestRunLockLost(t *testing.T) {
+	const subscription = "projects/test-project/subscriptions/lock-lost"
+	const wantLog = `level=ERROR msg="the subscription lock file was removed or replaced; stopped receiving so that no second process receives beside this one"`
+
+	tests := map[string]struct {
+		// relock takes the lock again after the removal, as a second process
+		// starting then would.
+		relock bool
+	}{
+		"error: lock file removed while receiving": {},
+		"error: lock file removed and locked again by another process while receiving": {
+			relock: true,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			lockDir := t.TempDir()
+			opts, _ := countingEndpoint(t)
+			s := startServer(t, []string{"-enable", "-subscription", subscription}, nil, lockDir, opts)
+			s.handshake(t)
+			s.waitForLog(t, "session initialized; receiving")
+
+			path := lock.Path(lockDir, subscription)
+			if err := os.Remove(path); err != nil {
+				t.Fatalf("remove the lock file: %v", err)
+			}
+			var wantHolder string
+			if tt.relock {
+				l, err := lock.Acquire(lockDir, subscription)
+				if err != nil {
+					t.Fatalf("lock the new lock file: %v", err)
+				}
+				t.Cleanup(func() { _ = l.Release() })
+				if err := l.WriteHolder(time.Now(), subscription); err != nil {
+					t.Fatalf("record the new holder: %v", err)
+				}
+				wantHolder = lock.Holder(lockDir, subscription)
+			}
+			removed := time.Now()
+
+			if code := s.exitCode(t, lock.CheckInterval+shutdownBound); code != exitFailure {
+				t.Errorf("exit code = %d, want %d; stderr:\n%s", code, exitFailure, s.stderr.String())
+			}
+			t.Logf("run returned %v after the lock file was removed", time.Since(removed))
+			stderr := s.stderr.String()
+			if n := strings.Count(stderr, wantLog); n != 1 {
+				t.Errorf("stderr has %q %d times, want once; stderr:\n%s", wantLog, n, stderr)
+			}
+			if diff := gocmp.Diff(wantHolder, lock.Holder(lockDir, subscription)); diff != "" {
+				t.Errorf("holder text of the file now at the lock path (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestRunExclusiveAgainstEmulator runs two enabled servers on one subscription
+// with one lock directory, as two Claude Code processes on one machine would,
+// and checks that only the first receives, and that the second stays idle even
+// after the first has exited.
+func TestRunExclusiveAgainstEmulator(t *testing.T) {
+	tests := map[string]struct {
+		first, second *pubsub.Message
+	}{
+		"success: only the lock holder delivers and the loser never takes over": {
+			first:  &pubsub.Message{Data: []byte("for the holder")},
+			second: &pubsub.Message{Data: []byte("after the holder exited")},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := testsupport.NewFixture(t, testsupport.EmulatorClient(t))
+			lockDir := t.TempDir()
+			args := []string{"-enable", "-subscription", f.Subscription}
+
+			holder := startRun(t, args, lockDir)
+			// The holder takes the lock before it answers initialize, so the
+			// second server starts only once the lock is taken.
+			holder.handshake(t)
+			holder.waitForLog(t, "session initialized; receiving")
+
+			loser := startRun(t, args, lockDir)
+			result := loser.handshake(t)
+			if diff := gocmp.Diff(event.InactiveInstructions(f.Subscription), result["instructions"]); diff != "" {
+				t.Errorf("loser instructions (-want +got):\n%s", diff)
+			}
+			loser.waitForLog(t, "another pubsub-channel process on this machine is receiving from "+f.Subscription)
+
+			id := f.Publish(t, tt.first)
+			n := testsupport.DecodeNotification(t, holder.client.Next(t, testsupport.DeliveryTimeout), channel.NotificationMethod)
+			if diff := gocmp.Diff(id, n.Params.Meta[event.KeyMessageID]); diff != "" {
+				t.Errorf("holder delivered another message (-want +got):\n%s", diff)
+			}
+			loser.client.ExpectSilence(t, 2*time.Second)
+
+			holder.client.CloseInput()
+			if code := holder.exitCode(t, 30*time.Second); code != exitOK {
+				t.Errorf("holder exit code = %d, want %d; stderr:\n%s", code, exitOK, holder.stderr.String())
+			}
+
+			secondID := f.Publish(t, tt.second)
+			loser.client.ExpectSilence(t, 3*time.Second)
+			if strings.Contains(loser.stderr.String(), "session initialized; receiving") {
+				t.Errorf("loser started receiving; stderr:\n%s", loser.stderr.String())
+			}
+			// Nothing pulled the second message: it is still in the
+			// subscription for another subscriber.
+			ctx, cancel := context.WithTimeout(t.Context(), testsupport.DeliveryTimeout)
+			defer cancel()
+			var pulled atomic.Bool
+			if err := f.Client.Subscriber(f.Subscription).Receive(ctx, func(_ context.Context, m *pubsub.Message) {
+				m.Ack()
+				if m.ID == secondID {
+					pulled.Store(true)
+					cancel()
+				}
+			}); err != nil {
+				t.Fatalf("pull the second message: %v", err)
+			}
+			if !pulled.Load() {
+				t.Errorf("message %s published after the holder exited was not left in the subscription", secondID)
+			}
+
+			loser.client.CloseInput()
+			if code := loser.exitCode(t, shutdownBound); code != exitOK {
+				t.Errorf("loser exit code = %d, want %d; stderr:\n%s", code, exitOK, loser.stderr.String())
 			}
 		})
 	}

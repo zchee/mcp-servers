@@ -4,9 +4,16 @@
 // and pushes each one into the running Claude Code session as a channel event.
 // The channel is one-way: it exposes no tools and sends nothing back.
 //
+// Claude Code starts an enabled plugin's MCP server in every one of its
+// processes, not only in the session that registered the channel, and tells
+// the server nothing about that registration. Receiving is therefore off
+// unless -enable or PUBSUB_CHANNEL_ENABLE turns it on, and an enabled server
+// receives only while it holds an exclusive lock on the subscription; a server
+// that does neither stays connected but idle.
+//
 // Usage:
 //
-//	pubsub-channel -subscription projects/my-project/subscriptions/my-sub
+//	pubsub-channel -enable -subscription projects/my-project/subscriptions/my-sub
 //
 // Stdout carries MCP protocol frames only; every log line goes to stderr.
 package main
@@ -26,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	pubsub "cloud.google.com/go/pubsub/v2"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -34,6 +42,7 @@ import (
 	"github.com/zchee/mcp-servers/pubsub-channel/internal/bridge"
 	"github.com/zchee/mcp-servers/pubsub-channel/internal/channel"
 	"github.com/zchee/mcp-servers/pubsub-channel/internal/event"
+	"github.com/zchee/mcp-servers/pubsub-channel/internal/lock"
 )
 
 const serverName = "pubsub-channel"
@@ -44,6 +53,7 @@ const (
 	envSubscription = "PUBSUB_CHANNEL_SUBSCRIPTION"
 	envMaxRate      = "PUBSUB_CHANNEL_MAX_RATE"
 	envMaxBurst     = "PUBSUB_CHANNEL_MAX_BURST"
+	envEnable       = "PUBSUB_CHANNEL_ENABLE"
 )
 
 // envEmulatorHost is the client library's variable that selects the Pub/Sub
@@ -68,7 +78,7 @@ func main() {
 		<-ctx.Done()
 		stop()
 	}()
-	code := run(ctx, os.Args[1:], os.Getenv, &mcp.StdioTransport{}, os.Stderr)
+	code := run(ctx, os.Args[1:], os.Getenv, &mcp.StdioTransport{}, os.Stderr, "")
 	stop()
 	os.Exit(code)
 }
@@ -83,6 +93,13 @@ type config struct {
 	maxContentBytes int
 	attributes      []string // nil forwards every attribute
 	instructions    string
+	// enable turns receiving on. Without it the server stays idle.
+	enable bool
+	// enableWarning reports a PUBSUB_CHANNEL_ENABLE value that is not a
+	// boolean. Such a value leaves receiving off instead of failing the
+	// configuration, so that a server started in every Claude Code process
+	// stays idle rather than failing in each of them.
+	enableWarning string
 }
 
 var (
@@ -102,8 +119,8 @@ var (
 )
 
 // parseConfig parses args, falling back to getenv for the project, the
-// subscription and the rate limit. Flag errors and the usage text are written
-// to stderr.
+// subscription, the rate limit and enabling receiving. Flag errors and the
+// usage text are written to stderr.
 func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (config, error) {
 	fs := flag.NewFlagSet(serverName, flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -124,7 +141,8 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	fs.IntVar(&cfg.maxBurst, "max-burst", bridge.DefaultMaxBurst, "maximum events delivered at once before -max-rate applies (env "+envMaxBurst+")")
 	fs.IntVar(&cfg.maxContentBytes, "max-content-bytes", event.DefaultMaxContentBytes, "maximum size in bytes of one event's content, at least "+strconv.Itoa(event.MinContentBytes)+"; longer content is truncated")
 	fs.StringVar(&attributes, "attributes", "", "comma-separated message attribute keys to forward; empty forwards all")
-	fs.StringVar(&cfg.instructions, "instructions", "", "system-prompt instructions for the channel; empty uses a built-in description of the events. A custom text replaces the built-in warning that events are untrusted, so it must give one itself")
+	fs.StringVar(&cfg.instructions, "instructions", "", "system-prompt instructions for the channel; empty uses a built-in description of the events. A custom text replaces the built-in warning that events are untrusted, so it must give one itself. An idle server always uses a built-in text saying no events will arrive")
+	fs.BoolVar(&cfg.enable, "enable", false, "receive from the subscription; without it the server completes the MCP handshake and stays idle (env "+envEnable+")")
 
 	// The flag package prints the usage itself for a parse error.
 	if err := fs.Parse(args); err != nil {
@@ -149,6 +167,13 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 			return config{}, fmt.Errorf("%s=%q is not an integer", envMaxBurst, v)
 		}
 		cfg.maxBurst = n
+	}
+	if v := getenv(envEnable); v != "" && !set["enable"] {
+		if b, err := strconv.ParseBool(v); err != nil {
+			cfg.enableWarning = fmt.Sprintf("%s=%q is not a boolean; receiving stays disabled", envEnable, v)
+		} else {
+			cfg.enable = b
+		}
 	}
 	cfg, err := validate(cfg, attributes, fs.Args(), getenv(envEmulatorHost) != "")
 	if err != nil {
@@ -250,9 +275,11 @@ func validateSubscriptionID(id string) error {
 }
 
 // run serves the channel over transport until the client disconnects, ctx is
-// cancelled, or Pub/Sub fails, and returns the process exit code. clientOpts
-// are passed to the Pub/Sub client.
-func run(ctx context.Context, args []string, getenv func(string) string, transport mcp.Transport, stderr io.Writer, clientOpts ...option.ClientOption) int {
+// cancelled, or Pub/Sub fails, and returns the process exit code. lockDir is
+// the directory of the subscription lock files; empty selects
+// lock.DefaultDir. clientOpts are passed to the Pub/Sub client.
+func run(ctx context.Context, args []string, getenv func(string) string, transport mcp.Transport, stderr io.Writer, lockDir string, clientOpts ...option.ClientOption) int {
+	started := time.Now()
 	cfg, err := parseConfig(args, getenv, stderr)
 	if errors.Is(err, flag.ErrHelp) {
 		return exitOK
@@ -263,6 +290,50 @@ func run(ctx context.Context, args []string, getenv func(string) string, transpo
 	}
 
 	logger := slog.New(slog.NewTextHandler(stderr, nil)).With("subscription", cfg.subscription)
+	if cfg.enableWarning != "" {
+		logger.Warn(cfg.enableWarning)
+	}
+
+	// An idle server touches neither the lock directory nor Pub/Sub, so the
+	// sessions that are not meant to receive cost no credentials lookup and
+	// no network connection.
+	if !cfg.enable {
+		logger.Info("receiving is disabled; to receive, set " + envEnable + "=1 or pass -enable on the command line of the one Claude Code session that should")
+		return idle(ctx, cfg, transport, logger, stderr)
+	}
+
+	if lockDir == "" {
+		if lockDir, err = lock.DefaultDir(); err != nil {
+			_, _ = fmt.Fprintf(stderr, "%s: refusing to receive from %s without the subscription lock: %v\n", serverName, cfg.subscription, err)
+			return exitFailure
+		}
+	}
+	// Taken before the handshake because the instructions sent in it depend
+	// on whether this server receives. A server that loses the race never
+	// retries: agent-team workers inherit the environment of the session that
+	// started them, and retrying would let one of them take over when that
+	// session ends.
+	l, err := lock.Acquire(lockDir, cfg.subscription)
+	if errors.Is(err, lock.ErrHeld) {
+		logger.Info("another pubsub-channel process on this machine is receiving from "+cfg.subscription+"; this server stays idle for its lifetime",
+			"lock", lock.Path(lockDir, cfg.subscription), "holder", lock.Holder(lockDir, cfg.subscription))
+		return idle(ctx, cfg, transport, logger, stderr)
+	}
+	if err != nil {
+		// Receiving without the lock is what the lock exists to prevent.
+		_, _ = fmt.Fprintf(stderr, "%s: refusing to receive from %s without the subscription lock: %v\n", serverName, cfg.subscription, err)
+		return exitFailure
+	}
+	// Deferred first, so it runs last: the lock is released only after the
+	// pull stream and the client have stopped.
+	defer func() {
+		if err := l.Release(); err != nil {
+			logger.Warn("release subscription lock", "error", err)
+		}
+	}()
+	if err := l.WriteHolder(started, cfg.subscription); err != nil {
+		logger.Warn("record the lock holder; the lock is held regardless", "error", err)
+	}
 
 	client, err := pubsub.NewClient(ctx, cfg.project, clientOpts...)
 	if err != nil {
@@ -300,14 +371,39 @@ func run(ctx context.Context, args []string, getenv func(string) string, transpo
 	}
 	logger.Info("session initialized; receiving")
 
+	// The lock belongs to the open file. If the file is removed or replaced,
+	// another process can lock a new file at the same path and receive too,
+	// so this server stops receiving and exits once it notices.
+	lockLost := make(chan error, 1)
+	go func() {
+		err := l.Watch(ctx, lock.CheckInterval)
+		if err != nil {
+			logger.Error("the subscription lock file was removed or replaced; stopped receiving so that no second process receives beside this one", "lock", l.Path(), "error", err)
+			cancel()
+		}
+		lockLost <- err
+	}()
+
 	recvErr := b.Run(ctx, sub)
 	cancel()
 	sessionErr := <-sessionDone
+	if err := <-lockLost; err != nil {
+		return exitFailure
+	}
 	if recvErr != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: %v\n", serverName, recvErr)
 		return exitFailure
 	}
 	return sessionExitCode(sessionErr, stderr)
+}
+
+// idle serves the MCP session without receiving until the client disconnects
+// or ctx is cancelled, and returns the exit code. Its instructions say that no
+// events will arrive, replacing any custom -instructions, which describe
+// events.
+func idle(ctx context.Context, cfg config, transport mcp.Transport, logger *slog.Logger, stderr io.Writer) int {
+	ch := channel.New(channel.Options{Name: serverName, Version: moduleVersion(), Instructions: event.InactiveInstructions(cfg.subscription), Logger: logger})
+	return sessionExitCode(ch.Run(ctx, transport), stderr)
 }
 
 // sessionExitCode maps the error that ended the MCP session to an exit code.
