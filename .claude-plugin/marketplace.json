@@ -1,0 +1,52 @@
+{
+  "name": "zchee-mcp-servers",
+  "description": "MCP servers maintained in zchee/mcp-servers.",
+  "owner": {
+    "name": "Koichi Shiraishi",
+    "url": "https://github.com/zchee"
+  },
+  "plugins": [
+    {
+      "name": "pubsub-channel",
+      "source": "./pubsub-channel",
+      "description": "Claude Code channel that pushes Google Cloud Pub/Sub messages into a running session.",
+      "category": "integration",
+      "tags": [
+        "channel",
+        "gcp",
+        "pubsub",
+        "mcp"
+      ],
+      "mcpServers": {
+        "pubsub-channel": {
+          "type": "stdio",
+          "command": "pubsub-channel",
+          "args": [],
+          "env": {
+            "PUBSUB_CHANNEL_PROJECT": "${user_config.project}",
+            "PUBSUB_CHANNEL_SUBSCRIPTION": "${user_config.subscription}"
+          }
+        }
+      },
+      "channels": [
+        {
+          "server": "pubsub-channel",
+          "displayName": "Pub/Sub",
+          "userConfig": {
+            "subscription": {
+              "type": "string",
+              "title": "Subscription",
+              "description": "Subscription ID, or the full name projects/<project>/subscriptions/<subscription>.",
+              "required": true
+            },
+            "project": {
+              "type": "string",
+              "title": "Project",
+              "description": "Google Cloud project ID. Leave empty when the subscription is given as a full name."
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
