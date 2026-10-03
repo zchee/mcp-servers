@@ -24,7 +24,8 @@
           "args": [],
           "env": {
             "PUBSUB_CHANNEL_PROJECT": "${user_config.project}",
-            "PUBSUB_CHANNEL_SUBSCRIPTION": "${user_config.subscription}"
+            "PUBSUB_CHANNEL_SUBSCRIPTION": "${user_config.subscription}",
+            "PUBSUB_CHANNEL_ENABLE": "${PUBSUB_CHANNEL_ENABLE:-}"
           }
         }
       },
